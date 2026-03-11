@@ -30,7 +30,7 @@ import java.util.Locale;
  */
 public class A010RawDataActivity extends Activity {
 
-    private static final String TAG = "A010RawData";
+    private static final String TAG = "A010RawData222";
 
     // 帧格式常量
     private static final int HEADER_SIZE = 2;       // 0x00 0xFF
@@ -53,6 +53,10 @@ public class A010RawDataActivity extends Activity {
     private TextView logView;        // 下方日志
     private ScrollView scrollView;   // 滚动容器
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault());
+
+    // 设备配置状态
+    private int currentFps = 0;
+    private int currentUnit = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -134,31 +138,29 @@ public class A010RawDataActivity extends Activity {
             usbSerialPort.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
             Log.i(TAG, "串口已打开，波特率: 115200");
 
-            Thread.sleep(300);
+            Thread.sleep(500);  // 增加等待时间，让设备稳定
             clearBuffer();
 
-            // Step 2: 配置设备 - 使用默认波特率发送AT命令
+            // Step 2: 关闭 ISP，确保没有帧数据干扰 AT 命令
             sendAtWithResponse("AT+ISP=0\r\n", "关闭ISP");
-            sendAtWithResponse("AT+BAUD=7\r\n", "设置波特率2000000");   // 7 = 2000000
-            sendAtWithResponse("AT+SAVE\r\n", "保存配置");
-            Thread.sleep(100);
+            Thread.sleep(500);  // 等待 ISP 完全关闭
 
-            // Step 3: 切换到高波特率
-            usbSerialPort.setParameters(2000000, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
-            Log.i(TAG, "波特率已切换: 2000000");
-
-            Thread.sleep(200);
-            clearBuffer();
-
-            // Step 4: 使用高波特率配置其他参数
-            sendAtWithResponse("AT+ISP=1\r\n", "启动ISP");
+            // Step 3: 在 ISP 关闭状态下配置所有参数（此时无帧数据干扰）
             sendAtWithResponse("AT+BINN=1\r\n", "分辨率100x100");
-            sendAtWithResponse("AT+UNIT=1\r\n", "单位1mm");      // 新增: 设置单位为1mm
+            Thread.sleep(200);
+            sendAtWithResponse("AT+UNIT=0\r\n", "自动量化");
+            Thread.sleep(200);
             sendAtWithResponse("AT+FPS=15\r\n", "帧率15fps");
-            sendAtWithResponse("AT+DISP=6\r\n", "USB+UART输出");
+            Thread.sleep(200);
+            sendAtWithResponse("AT+DISP=6\r\n", "USB+UART输出");  // 6 = USB+UART
+            Thread.sleep(200);
             sendAtWithResponse("AT+SAVE\r\n", "保存配置");
+            Thread.sleep(500);
 
-            Thread.sleep(300);
+            // Step 4: 最后启动 ISP（开始输出帧数据）
+            sendAtWithResponse("AT+ISP=1\r\n", "启动ISP");
+            Log.i(TAG, "ISP 已启动，等待稳定...");
+            Thread.sleep(2000);  // ISP 启动需要 1-2 秒
 
             // Step 5: 查询设备状态
             String deviceStatus = queryDeviceStatus();
@@ -390,26 +392,36 @@ public class A010RawDataActivity extends Activity {
                 byte[] metaData = Arrays.copyOfRange(data, metaStart, metaStart + META_SIZE);
                 byte[] firstRow = Arrays.copyOfRange(data, pixelStart, pixelStart + 100);
 
+                // 第50行50列附近的像素 (中心区域) - 偏移 = 50*100+50 = 5050
+                int centerOffset = 50 * 100 + 50;
+                byte[] centerPixels = Arrays.copyOfRange(data, pixelStart + centerOffset, pixelStart + centerOffset + 10);
+
                 frameCounter++;
                 foundFrame = true;
                 String time = timeFormat.format(new Date());
 
                 // 详细调试：打印帧位置信息和像素值
                 Log.i(TAG, String.format("Frame #%d @ buffer_pos=%d, frameSize=%d", frameCounter, pos, frameSize));
-                Log.i(TAG, String.format("  pixels[0-9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                Log.i(TAG, String.format("  firstRow[0-9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                         firstRow[0] & 0xFF, firstRow[1] & 0xFF, firstRow[2] & 0xFF,
                         firstRow[3] & 0xFF, firstRow[4] & 0xFF, firstRow[5] & 0xFF,
                         firstRow[6] & 0xFF, firstRow[7] & 0xFF, firstRow[8] & 0xFF,
                         firstRow[9] & 0xFF));
+                Log.i(TAG, String.format("  center[5050-5059]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                        centerPixels[0] & 0xFF, centerPixels[1] & 0xFF, centerPixels[2] & 0xFF,
+                        centerPixels[3] & 0xFF, centerPixels[4] & 0xFF, centerPixels[5] & 0xFF,
+                        centerPixels[6] & 0xFF, centerPixels[7] & 0xFF, centerPixels[8] & 0xFF,
+                        centerPixels[9] & 0xFF));
 
                 // 更新UI
                 final int frameNum = frameCounter;
                 final String frameTime = time;
                 final byte[] meta = metaData;
                 final byte[] pixels = firstRow.clone();
+                final byte[] center = centerPixels.clone();
 
                 runOnUiThread(() -> {
-                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels));
+                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels, center));
                 });
 
                 // 移除已处理的帧 - 关键：正确更新buffer
@@ -441,15 +453,22 @@ public class A010RawDataActivity extends Activity {
         }
     }
 
-    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels) {
+    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels, byte[] center) {
         StringBuilder sb = new StringBuilder();
         sb.append("═══════════════════════════════════════\n");
-        sb.append("帧: #").append(frameNum).append("  ").append(time).append("\n");
+        sb.append("帧: #").append(frameNum).append("  ").append(time);
+        sb.append(" [").append(frameNum % 10).append("]\n");  // 添加变化标记
         sb.append("───────────────────────────────────────\n");
-        // 显示前10个像素的十进制值，方便观察变化
+        // 第一行像素
         sb.append("像素[0-9]: ");
         for (int i = 0; i < 10 && i < pixels.length; i++) {
             sb.append(String.format("%3d ", pixels[i] & 0xFF));
+        }
+        sb.append("\n");
+        // 中心区域像素 (第50行50列)
+        sb.append("中心[5050-5059]: ");
+        for (int i = 0; i < 10 && i < center.length; i++) {
+            sb.append(String.format("%3d ", center[i] & 0xFF));
         }
         sb.append("\n");
         sb.append("───────────────────────────────────────\n");
