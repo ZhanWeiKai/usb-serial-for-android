@@ -48,6 +48,10 @@ public class A010RawDataActivity extends Activity {
     private int frameCounter = 0;
     private volatile boolean running = true;
 
+    // 帧验证统计
+    private int validFrameCount = 0;
+    private int invalidFrameCount = 0;
+
     // UI
     private TextView fixedInfo;      // 上方固定信息
     private TextView logView;        // 下方日志
@@ -385,6 +389,26 @@ public class A010RawDataActivity extends Activity {
                     break;  // 等待更多数据
                 }
 
+                // 验证包尾 0xDD
+                int tailPos = pos + frameSize - 1;
+                int tailByte = data[tailPos] & 0xFF;
+                boolean frameValid = (tailByte == 0xDD);
+
+                if (!frameValid) {
+                    invalidFrameCount++;
+                    Log.w(TAG, String.format("Invalid tail: 0x%02X (expected 0xDD) at frame #%d", tailByte, frameCounter + 1));
+                    // 显示失败信息到UI
+                    final int failFrameNum = frameCounter + 1;
+                    final int failTail = tailByte;
+                    runOnUiThread(() -> {
+                        appendLog(String.format("❌ Frame #%d 尾部验证失败: 0x%02X (期望 0xDD)", failFrameNum, failTail));
+                    });
+                    pos++;
+                    continue;
+                }
+
+                validFrameCount++;
+
                 // 提取数据 - 从帧头开始计算偏移
                 int metaStart = pos + HEADER_SIZE + LENGTH_SIZE;  // pos + 4
                 int pixelStart = metaStart + META_SIZE;            // pos + 20
@@ -401,7 +425,7 @@ public class A010RawDataActivity extends Activity {
                 String time = timeFormat.format(new Date());
 
                 // 详细调试：打印帧位置信息和像素值
-                Log.i(TAG, String.format("Frame #%d @ buffer_pos=%d, frameSize=%d", frameCounter, pos, frameSize));
+                Log.i(TAG, String.format("Frame #%d @ buffer_pos=%d, frameSize=%d, tail=0x%02X ✓", frameCounter, pos, frameSize, tailByte));
                 Log.i(TAG, String.format("  firstRow[0-9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                         firstRow[0] & 0xFF, firstRow[1] & 0xFF, firstRow[2] & 0xFF,
                         firstRow[3] & 0xFF, firstRow[4] & 0xFF, firstRow[5] & 0xFF,
@@ -419,9 +443,11 @@ public class A010RawDataActivity extends Activity {
                 final byte[] meta = metaData;
                 final byte[] pixels = firstRow.clone();
                 final byte[] center = centerPixels.clone();
+                final int validCount = validFrameCount;
+                final int invalidCount = invalidFrameCount;
 
                 runOnUiThread(() -> {
-                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels, center));
+                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels, center, validCount, invalidCount));
                 });
 
                 // 移除已处理的帧 - 关键：正确更新buffer
@@ -453,11 +479,12 @@ public class A010RawDataActivity extends Activity {
         }
     }
 
-    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels, byte[] center) {
+    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels, byte[] center, int validCount, int invalidCount) {
         StringBuilder sb = new StringBuilder();
         sb.append("═══════════════════════════════════════\n");
         sb.append("帧: #").append(frameNum).append("  ").append(time);
-        sb.append(" [").append(frameNum % 10).append("]\n");  // 添加变化标记
+        sb.append(" [").append(frameNum % 10).append("]");
+        sb.append(" ✓有效:").append(validCount).append(" ✗无效:").append(invalidCount).append("\n");
         sb.append("───────────────────────────────────────\n");
         // 第一行像素
         sb.append("像素[0-9]: ");
