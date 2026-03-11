@@ -487,18 +487,32 @@ public class A010RawDataActivity extends Activity {
         sb.append(" [").append(frameNum % 10).append("]");
         sb.append(" ✓有效:").append(validCount).append(" ✗无效:").append(invalidCount).append("\n");
         sb.append("───────────────────────────────────────\n");
-        // 第一行像素
-        sb.append("像素[0-9]: ");
+        // 第一行像素 (原始值)
+        sb.append("像素[0-9]:   ");
         for (int i = 0; i < 10 && i < pixels.length; i++) {
             sb.append(String.format("%3d ", pixels[i] & 0xFF));
         }
         sb.append("\n");
-        // 中心区域像素 (第50行50列)
-        sb.append("中心[5050-5059]: ");
+        // 第一行像素 (距离 cm) - UNIT=0: 距离(mm) = (p/5.1)²
+        sb.append("距离[0-9]:   ");
+        for (int i = 0; i < 10 && i < pixels.length; i++) {
+            int distMm = calculateDistanceMm(pixels[i] & 0xFF);
+            sb.append(String.format("%3d ", distMm / 10));  // 转换为 cm
+        }
+        sb.append(" cm\n");
+        // 中心区域像素 (原始值)
+        sb.append("中心像素:   ");
         for (int i = 0; i < 10 && i < center.length; i++) {
             sb.append(String.format("%3d ", center[i] & 0xFF));
         }
         sb.append("\n");
+        // 中心区域像素 (距离 cm)
+        sb.append("中心距离:   ");
+        for (int i = 0; i < 10 && i < center.length; i++) {
+            int distMm = calculateDistanceMm(center[i] & 0xFF);
+            sb.append(String.format("%3d ", distMm / 10));  // 转换为 cm
+        }
+        sb.append(" cm\n");
         sb.append("───────────────────────────────────────\n");
         sb.append("元数据(16字节):\n");
         sb.append("  ").append(bytesToHex(meta, 0, 8)).append("\n");
@@ -509,6 +523,18 @@ public class A010RawDataActivity extends Activity {
         sb.append("  ").append(bytesToHex(pixels, 50, 100)).append("\n");
         sb.append("═══════════════════════════════════════");
         return sb.toString();
+    }
+
+    /**
+     * 计算像素值对应的距离 (UNIT=0 模式)
+     * 公式: 距离(mm) = (像素值 / 5.1)²
+     * @param pixelValue 像素值 (0-255)
+     * @return 距离 (mm)
+     */
+    private int calculateDistanceMm(int pixelValue) {
+        if (pixelValue == 0) return 0;
+        double distance = Math.pow(pixelValue / 5.1, 2);
+        return (int) Math.round(distance);
     }
 
     private String bytesToHex(byte[] data, int count) {
