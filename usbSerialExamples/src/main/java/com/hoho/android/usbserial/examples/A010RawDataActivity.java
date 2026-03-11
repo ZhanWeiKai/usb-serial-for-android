@@ -374,10 +374,11 @@ public class A010RawDataActivity extends Activity {
                 }
 
                 // 读取长度字段 (小端)
+                // payloadLen = 元数据(16) + 像素数据，不包含校验和包尾
                 int payloadLen = (data[pos + 2] & 0xFF) | ((data[pos + 3] & 0xFF) << 8);
-                int frameSize = HEADER_SIZE + LENGTH_SIZE + payloadLen;
+                int frameSize = HEADER_SIZE + LENGTH_SIZE + payloadLen + CHECKSUM_TAIL;  // +2 for checksum + tail
 
-                // 验证长度合理性 (预期: 10018 = 16 + 10000 + 1 + 1)
+                // 验证长度合理性 (预期 payloadLen = 10016 = 16 + 10000)
                 if (payloadLen < 10000 || payloadLen > 10050) {
                     Log.w(TAG, "Invalid payloadLen: " + payloadLen + " at pos=" + pos);
                     pos++;

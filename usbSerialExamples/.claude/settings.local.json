@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"C:/claude-project/sensor-a010/usb-serial-for-android/usbSerialExamples\" && ./gradlew.bat assembleDebug 2>&1 | tail -30)",
+      "Bash(scp -P 8022 -i ~/.ssh/id_ed25519 \"C:/claude-project/sensor-a010/usb-serial-for-android/usbSerialExamples/build/outputs/apk/debug/usbSerialExamples-debug.apk\" u0_a316@100.66.50.1:/sdcard/Download/)",
+      "Bash(ping -n 3 100.66.50.1)"
+    ]
+  }
+}

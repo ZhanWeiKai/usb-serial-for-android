@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew.bat assembleDebug:*)",
+      "Bash(scp:*)",
+      "Bash(ssh:*)",
+      "Bash(./gradlew assembleDebug:*)",
+      "Bash(adb:*)",
+      "Bash(./gradlew clean:*)",
+      "Bash(build_install:*)",
+      "Bash(cd /c/claude-project/sensor-a010/usb-serial-for-android && git add usbSerialExamples/src/main/java/com/hoho/android/usbserial/examples/A010RawDataActivity.java usbSerialExamples/src/main/java/com/hoho/android/usbserial/examples/A010AtQuickTestActivity.java usbSerialExamples/src/main/AndroidManifest.xml)",
+      "Bash(cd /c/claude-project/sensor-a010/usb-serial-for-android && git commit -m \"$\\(cat <<'EOF'\nfeat: A010RawDataActivity 实时获取原始串口数据\n\n- 新增 A010RawDataActivity，可实时显示原始深度数据帧\n- 上方固定区域：帧序号、时间、元数据\\(16字节\\)、第一行像素\\(100字节\\)\n- 下方滚动日志：显示AT命令交互记录\n- 修复帧解析的竞态条件：使用同步锁保护整个解析过程\n- 支持 2000000 波特率，100x100分辨率，15fps\n- 同时更新 A010AtQuickTestActivity 的帧解析逻辑\n\n关键修复：parseFramesLocked\\(\\) 方法使用 synchronized 保护 buffer 的读写操作，\n确保在高波特率下正确解析连续的深度数据帧。\n\nGenerated with [Claude Code]\\(https://claude.ai/code\\)\nvia [Happy]\\(https://happy.engineering\\)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nCo-Authored-By: Happy <yesreply@happy.engineering>\nEOF\n\\)\")",
+      "Bash(cd /c/claude-project/sensor-a010/usb-serial-for-android && git push)",
+      "Bash(git:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
