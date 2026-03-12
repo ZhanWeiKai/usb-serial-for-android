@@ -49,6 +49,7 @@ public class ObjectMeasurementActivity extends Activity {
 
     // 稳定性阈值
     private static final float BASELINE_AVG_THRESHOLD_MM = 60.0f;  // 基线平均值差异阈值 (mm)
+    private static final float POSITION_CHANGE_THRESHOLD_MM = 100.0f;  // 位置变化阈值 (mm)
     private static final float VOLUME_THRESHOLD_CM3 = 50.0f;       // 体积差异阈值 (cm³)
 
     // ObjectDimensionCalculator 参数
@@ -77,6 +78,7 @@ public class ObjectMeasurementActivity extends Activity {
 
     // 基线数据
     private float[][] baselineDepth;  // [100][100] mm
+    private float[][] savedBaseline;  // 已保存的基线（用于位置校验，不会被更新）
 
     // 测量数据
     private float[][] currentDepth;   // [100][100] mm
@@ -404,19 +406,23 @@ public class ObjectMeasurementActivity extends Activity {
     // ==================== 阶段1: 基线校准 ====================
 
     private void startCalibration() {
-        if (currentPhase != MeasurementPhase.IDLE && currentPhase != MeasurementPhase.MEASURED) {
+        // 允许从 IDLE, MEASURED, 或 CALIBRATED（自动重新校准）状态开始
+        if (currentPhase == MeasurementPhase.CALIBRATING || currentPhase == MeasurementPhase.MEASURING) {
             return;
         }
 
         currentPhase = MeasurementPhase.CALIBRATING;
         stableCount = 0;
         baselineDepth = null;
+        savedBaseline = null;  // 清除已保存的基线
 
-        btnCalibrate.setEnabled(false);
-        btnMeasure.setEnabled(false);
-        statusText.setText("状态: 基线校准中...");
-        infoText.setText("正在采集空桌面数据...\n请保持桌面清洁\n\n稳定进度: 0/4");
-        appendLog("开始基线校准");
+        runOnUiThread(() -> {
+            btnCalibrate.setEnabled(false);
+            btnMeasure.setEnabled(false);
+            statusText.setText("状态: 基线校准中...");
+            infoText.setText("正在采集空桌面数据...\n请保持桌面清洁\n\n稳定进度: 0/10");
+            appendLog("开始基线校准");
+        });
 
         // 启动定时采样
         startSampling(this::processCalibrationSample);
@@ -471,7 +477,8 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void finishCalibration() {
-        stopSampling();
+        // 保存已校准的基线（深拷贝，用于位置校验）
+        savedBaseline = copyDepthArray(baselineDepth);
 
         // 计算中心区域(10x10)平均深度
         float centerDepth = calculateCenterDepth(baselineDepth);
@@ -484,17 +491,60 @@ public class ObjectMeasurementActivity extends Activity {
             btnMeasure.setEnabled(true);
             btnCalibrate.setEnabled(true);
 
-            statusText.setText("状态: 基线校准完成 ✓");
+            statusText.setText("状态: 基线校准完成 ✓ (监控中)");
             StringBuilder sb = new StringBuilder();
             sb.append("══════ 基线校准完成 ══════\n\n");
             sb.append(String.format("中心点深度: %.0f mm\n\n", centerDepth));
             sb.append("基线已保存到本地\n\n");
             sb.append("基线深度统计:\n");
             sb.append(getDepthStatistics(baselineDepth));
-            sb.append("\n\n点击 [开始测量] 进入测量阶段");
+            sb.append("\n\n正在监控位置变化...");
             infoText.setText(sb.toString());
-            appendLog(String.format("基线校准完成，中心点深度: %.0f mm", centerDepth));
+            appendLog(String.format("基线校准完成，中心点深度: %.0f mm，开始监控位置变化", centerDepth));
         });
+
+        // 不停止采样，切换到位置监控模式
+        stopSampling();
+        startSampling(this::monitorPosition);
+    }
+
+    /**
+     * 深拷贝深度数组
+     */
+    private float[][] copyDepthArray(float[][] source) {
+        if (source == null) return null;
+        float[][] copy = new float[source.length][];
+        for (int i = 0; i < source.length; i++) {
+            copy[i] = source[i].clone();
+        }
+        return copy;
+    }
+
+    /**
+     * 监控位置变化
+     */
+    private void monitorPosition() {
+        if (latestDepthData == null || savedBaseline == null) {
+            return;
+        }
+
+        // 将原始数据转换为距离矩阵
+        float[][] currentFrame = convertToDistanceMatrix(latestDepthData);
+
+        // 计算与已保存基线的差异
+        float avgDiff = calculateAverageDifference(savedBaseline, currentFrame);
+
+        if (avgDiff >= POSITION_CHANGE_THRESHOLD_MM) {
+            // 位置变化超过阈值，自动重新校准
+            runOnUiThread(() -> {
+                appendLog(String.format("⚠ 检测到位置变化: %.0f mm >= %.0f mm，开始重新校准", avgDiff, POSITION_CHANGE_THRESHOLD_MM));
+                statusText.setText("状态: 检测到位置变化，重新校准中...");
+            });
+
+            // 停止监控，开始重新校准
+            stopSampling();
+            startCalibration();
+        }
     }
 
     /**
@@ -525,6 +575,9 @@ public class ObjectMeasurementActivity extends Activity {
             return;
         }
 
+        // 停止位置监控
+        stopSampling();
+
         // 加载基线
         if (baselineDepth == null) {
             baselineDepth = depthStorage.loadBaseline();
@@ -539,11 +592,13 @@ public class ObjectMeasurementActivity extends Activity {
         lastVolume = 0;
         lastResult = null;
 
-        btnCalibrate.setEnabled(false);
-        btnMeasure.setEnabled(false);
-        statusText.setText("状态: 物体测量中...");
-        infoText.setText("正在测量物体尺寸...\n\n请将物体放置在桌面上\n\n稳定进度: 0/4");
-        appendLog("开始物体测量");
+        runOnUiThread(() -> {
+            btnCalibrate.setEnabled(false);
+            btnMeasure.setEnabled(false);
+            statusText.setText("状态: 物体测量中...");
+            infoText.setText(String.format("正在测量物体尺寸...\n\n请将物体放置在桌面上\n\n稳定进度: 0/%d", STABLE_COUNT_REQUIRED));
+            appendLog("开始物体测量");
+        });
 
         // 启动定时采样
         startSampling(this::processMeasurementSample);
@@ -733,6 +788,7 @@ public class ObjectMeasurementActivity extends Activity {
         lastResult = null;
         currentDepth = null;
         baselineDepth = null;
+        savedBaseline = null;  // 清除已保存的基线
 
         // 删除保存的基线文件
         boolean deleted = depthStorage.deleteBaseline();

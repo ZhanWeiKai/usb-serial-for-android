@@ -416,7 +416,7 @@ public class A010RawDataActivity extends Activity {
 
                 byte[] metaData = Arrays.copyOfRange(data, metaStart, metaStart + META_SIZE);
                 byte[] firstRow = Arrays.copyOfRange(data, pixelStart, pixelStart + 100);
-
+                byte[] depthData = Arrays.copyOfRange(data, pixelStart, pixelStart + 100*100);
                 // 第50行50列附近的像素 (中心区域) - 偏移 = 50*100+50 = 5050
                 int centerOffset = 50 * 100 + 50;
                 byte[] centerPixels = Arrays.copyOfRange(data, pixelStart + centerOffset, pixelStart + centerOffset + 10);
@@ -444,11 +444,12 @@ public class A010RawDataActivity extends Activity {
                 final byte[] meta = metaData;
                 final byte[] pixels = firstRow.clone();
                 final byte[] center = centerPixels.clone();
+                final byte[] depth = depthData.clone();
                 final int validCount = validFrameCount;
                 final int invalidCount = invalidFrameCount;
 
                 runOnUiThread(() -> {
-                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels, center, validCount, invalidCount));
+                    updateFixedInfo(formatFixedInfo(frameNum, frameTime, payloadLen, meta, pixels, center, depth, validCount, invalidCount));
                 });
 
                 // 移除已处理的帧 - 关键：正确更新buffer
@@ -480,12 +481,50 @@ public class A010RawDataActivity extends Activity {
         }
     }
 
-    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels, byte[] center, int validCount, int invalidCount) {
+    private String formatFixedInfo(int frameNum, String time, int payloadLen, byte[] meta, byte[] pixels, byte[] center, byte[] depth, int validCount, int invalidCount) {
         StringBuilder sb = new StringBuilder();
         sb.append("═══════════════════════════════════════\n");
         sb.append("帧: #").append(frameNum).append("  ").append(time);
         sb.append(" [").append(frameNum % 10).append("]");
         sb.append(" ✓有效:").append(validCount).append(" ✗无效:").append(invalidCount).append("\n");
+        sb.append("───────────────────────────────────────\n");
+
+        // 深度数据统计 (100x100)
+        sb.append("深度数组: ").append(depth.length).append(" 字节 (100x100)\n");
+
+        // 计算统计信息
+        int minDist = Integer.MAX_VALUE, maxDist = 0, sumDist = 0, validPixels = 0;
+        for (byte b : depth) {
+            int pixelValue = b & 0xFF;
+            int distMm = calculateDistanceMm(pixelValue);
+            if (distMm > 0) {
+                if (distMm < minDist) minDist = distMm;
+                if (distMm > maxDist) maxDist = distMm;
+                sumDist += distMm;
+                validPixels++;
+            }
+        }
+        int avgDist = validPixels > 0 ? sumDist / validPixels : 0;
+        if (minDist == Integer.MAX_VALUE) minDist = 0;
+
+        sb.append(String.format("距离统计: min=%d max=%d avg=%d mm\n", minDist, maxDist, avgDist));
+        sb.append(String.format("          min=%.1f max=%.1f avg=%.1f cm\n", minDist/10.0, maxDist/10.0, avgDist/10.0));
+        sb.append("───────────────────────────────────────\n");
+
+        // 中心区域 10x10 (第45-55行, 第45-55列)
+        sb.append("中心区域(10x10) 距离(cm):\n");
+        for (int row = 0; row < 10; row++) {
+            sb.append("  ");
+            for (int col = 0; col < 10; col++) {
+                int idx = (45 + row) * 100 + (45 + col);
+                if (idx < depth.length) {
+                    int distMm = calculateDistanceMm(depth[idx] & 0xFF);
+                    sb.append(String.format("%3d ", distMm / 10));
+                }
+            }
+            sb.append("\n");
+        }
+
         sb.append("───────────────────────────────────────\n");
         // 第一行像素 (原始值)
         sb.append("像素[0-9]:   ");
@@ -500,27 +539,6 @@ public class A010RawDataActivity extends Activity {
             sb.append(String.format("%3d ", distMm / 10));  // 转换为 cm
         }
         sb.append(" cm\n");
-        // 中心区域像素 (原始值)
-        sb.append("中心像素:   ");
-        for (int i = 0; i < 10 && i < center.length; i++) {
-            sb.append(String.format("%3d ", center[i] & 0xFF));
-        }
-        sb.append("\n");
-        // 中心区域像素 (距离 cm)
-        sb.append("中心距离:   ");
-        for (int i = 0; i < 10 && i < center.length; i++) {
-            int distMm = calculateDistanceMm(center[i] & 0xFF);
-            sb.append(String.format("%3d ", distMm / 10));  // 转换为 cm
-        }
-        sb.append(" cm\n");
-        sb.append("───────────────────────────────────────\n");
-        sb.append("元数据(16字节):\n");
-        sb.append("  ").append(bytesToHex(meta, 0, 8)).append("\n");
-        sb.append("  ").append(bytesToHex(meta, 8, 16)).append("\n");
-        sb.append("───────────────────────────────────────\n");
-        sb.append("第一行像素(100字节 HEX):\n");
-        sb.append("  ").append(bytesToHex(pixels, 0, 50)).append("\n");
-        sb.append("  ").append(bytesToHex(pixels, 50, 100)).append("\n");
         sb.append("═══════════════════════════════════════");
         return sb.toString();
     }
