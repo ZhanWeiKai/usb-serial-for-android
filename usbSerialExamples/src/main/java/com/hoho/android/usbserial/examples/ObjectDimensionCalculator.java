@@ -16,18 +16,18 @@ public class ObjectDimensionCalculator {
     private static final double COS_45 = Math.cos(Math.toRadians(45)); // ≈ 0.707
 
     // 输入数据
-    private float[][] baselineDepth;  // 空桌面深度 (cm)
-    private float[][] currentDepth;   // 放置物体后的深度 (cm)
-    private float pixelSizeX;         // 每个像素 X 方向实际宽度 (cm)
-    private float pixelSizeY;         // 每个像素 Y 方向实际长度 (cm)
-    private float threshold;          // 物体检测阈值 (cm)
+    private float[][] baselineDepth;  // 空桌面深度 (mm)
+    private float[][] currentDepth;   // 放置物体后的深度 (mm)
+    private float pixelSizeX;         // 每个像素 X 方向实际宽度 (mm)
+    private float pixelSizeY;         // 每个像素 Y 方向实际长度 (mm)
+    private float threshold;          // 物体检测阈值 (mm)
 
     // 计算结果
     private int[][] mask;             // 物体掩码: 1=物体, 0=背景
-    private float width;              // 物体宽度 W (cm)
-    private float length;             // 物体长度 L (cm)
-    private float height;             // 物体高度 H (cm)
-    private float thickness;          // 物体厚度 T (cm)
+    private float width;              // 物体宽度 W (mm)
+    private float length;             // 物体长度 L (mm)
+    private float height;             // 物体高度 H (mm)
+    private float thickness;          // 物体厚度 T (mm)
 
     // 调试信息
     private int xMin, xMax, yMin, yMax;  // mask 范围
@@ -36,11 +36,11 @@ public class ObjectDimensionCalculator {
     /**
      * 构造函数
      *
-     * @param baselineDepth 空桌面深度数组 [width][height], 单位: cm
-     * @param currentDepth  放置物体后的深度数组 [width][height], 单位: cm
-     * @param pixelSizeX    每个像素 X 方向对应的实际宽度 (cm)
-     * @param pixelSizeY    每个像素 Y 方向对应的实际长度 (cm)
-     * @param threshold     物体检测阈值 (cm), 建议 1~3 cm
+     * @param baselineDepth 空桌面深度数组 [width][height], 单位: mm
+     * @param currentDepth  放置物体后的深度数组 [width][height], 单位: mm
+     * @param pixelSizeX    每个像素 X 方向对应的实际宽度 (mm)
+     * @param pixelSizeY    每个像素 Y 方向对应的实际长度 (mm)
+     * @param threshold     物体检测阈值 (mm), 建议 10~30 mm
      */
     public ObjectDimensionCalculator(float[][] baselineDepth, float[][] currentDepth,
                                      float pixelSizeX, float pixelSizeY, float threshold) {
@@ -186,13 +186,13 @@ public class ObjectDimensionCalculator {
         sb.append("═══ 物体尺寸计算调试信息 ═══\n");
         sb.append(String.format("Mask 范围: x[%d-%d], y[%d-%d]\n", xMin, xMax, yMin, yMax));
         sb.append(String.format("物体像素数: %d\n", objectPixelCount));
-        sb.append(String.format("像素尺寸: X=%.3f cm, Y=%.3f cm\n", pixelSizeX, pixelSizeY));
-        sb.append(String.format("检测阈值: %.2f cm\n", threshold));
+        sb.append(String.format("像素尺寸: X=%.3f mm, Y=%.3f mm\n", pixelSizeX, pixelSizeY));
+        sb.append(String.format("检测阈值: %.2f mm\n", threshold));
         sb.append("───────────────────────────\n");
-        sb.append(String.format("宽度 W: %.2f cm\n", width));
-        sb.append(String.format("长度 L: %.2f cm\n", length));
-        sb.append(String.format("高度 H: %.2f cm (含cos45°校正)\n", height));
-        sb.append(String.format("厚度 T: %.2f cm (含cos45°校正)\n", thickness));
+        sb.append(String.format("宽度 W: %.2f mm\n", width));
+        sb.append(String.format("长度 L: %.2f mm\n", length));
+        sb.append(String.format("高度 H: %.2f mm (含cos45°校正)\n", height));
+        sb.append(String.format("厚度 T: %.2f mm (含cos45°校正)\n", thickness));
         sb.append("═══════════════════════════");
         return sb.toString();
     }
@@ -214,10 +214,10 @@ public class ObjectDimensionCalculator {
      * 计算结果封装类
      */
     public static class DimensionResult {
-        public final float width;      // 宽度 (cm)
-        public final float length;     // 长度 (cm)
-        public final float height;     // 高度 (cm)
-        public final float thickness;  // 厚度 (cm)
+        public final float width;      // 宽度 (mm)
+        public final float length;     // 长度 (mm)
+        public final float height;     // 高度 (mm)
+        public final float thickness;  // 厚度 (mm)
         public final String message;   // 状态消息
 
         public DimensionResult(float width, float length, float height, float thickness, String message) {
@@ -230,7 +230,7 @@ public class ObjectDimensionCalculator {
 
         @Override
         public String toString() {
-            return String.format("W=%.2fcm, L=%.2fcm, H=%.2fcm, T=%.2fcm | %s",
+            return String.format("W=%.2fmm, L=%.2fmm, H=%.2fmm, T=%.2fmm | %s",
                     width, length, height, thickness, message);
         }
     }

@@ -13,7 +13,7 @@
              then you should use singleTask, else a new MainActivity would be started
              when the settings activity is currently shown -->
         <activity
-            android:name=".A010RawDataActivity"
+            android:name=".ObjectMeasurementActivity"
             android:launchMode="singleTask"
             android:exported="true">
             <intent-filter>
@@ -27,6 +27,10 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/device_filter" />
         </activity>
+        <activity
+            android:name=".A010RawDataActivity"
+            android:launchMode="singleTask"
+            android:exported="false" />
         <activity
             android:name=".A010AtQuickTestActivity"
             android:launchMode="singleTask"
