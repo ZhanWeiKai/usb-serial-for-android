@@ -20,6 +20,7 @@ import com.hoho.android.usbserial.driver.UsbSerialProber;
 
 import java.io.ByteArrayOutputStream;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
@@ -45,17 +46,18 @@ public class ObjectMeasurementActivity extends Activity {
 
     // 采样参数
     private static final long SAMPLE_INTERVAL_MS = 500;  // 0.5秒采样间隔
-    private static final int STABLE_COUNT_REQUIRED = 10; // 连续10次稳定 = 5秒
+    private static final int STABLE_COUNT_CALIBRATE = 10; // 校准: 连续10次稳定 = 5秒
+    private static final int STABLE_COUNT_MEASURE = 10;   // 测量: 连续10次稳定 = 5秒
 
     // 稳定性阈值
     private static final float BASELINE_AVG_THRESHOLD_MM = 60.0f;  // 基线平均值差异阈值 (mm)
     private static final float POSITION_CHANGE_THRESHOLD_MM = 100.0f;  // 位置变化阈值 (mm)
-    private static final float VOLUME_THRESHOLD_CM3 = 50.0f;       // 体积差异阈值 (cm³)
+    private static final float DIMENSION_THRESHOLD_MM = 20.0f;     // 长宽高各维度偏差阈值 (mm)
 
-    // ObjectDimensionCalculator 参数
-    private static final float PIXEL_SIZE_X_MM = 5.0f;  // 待校准
-    private static final float PIXEL_SIZE_Y_MM = 5.0f;  // 待校准
-    private static final float OBJECT_THRESHOLD_MM = 20.0f;  // 物体检测阈值
+    // ObjectDimensionCalculator 参数 (基于 FOV 70°×60°, 中心距离 285mm 计算)
+    private static final float PIXEL_SIZE_X_MM = 4.0f;  // 水平: 2*285*tan(35°)/100
+    private static final float PIXEL_SIZE_Y_MM = 3.3f;  // 垂直: 2*285*tan(30°)/100
+    private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (考虑噪声余量)
 
     // 串口
     private UsbSerialPort usbSerialPort;
@@ -79,11 +81,13 @@ public class ObjectMeasurementActivity extends Activity {
     // 基线数据
     private float[][] baselineDepth;  // [100][100] mm
     private float[][] savedBaseline;  // 已保存的基线（用于位置校验，不会被更新）
+    private List<float[][]> calibrationFrames;  // 校准期间累积的稳定帧，用于多帧平均
 
     // 测量数据
     private float[][] currentDepth;   // [100][100] mm
+    private boolean[][] noiseMask;    // 噪声像素黑名单
     private ObjectDimensionCalculator.DimensionResult lastResult;
-    private float lastVolume = 0;
+    private float lastWidth = 0, lastLength = 0, lastHeight = 0;
     private int stableCount = 0;
 
     // UI
@@ -179,7 +183,13 @@ public class ObjectMeasurementActivity extends Activity {
 
         btnCalibrate = new Button(this);
         btnCalibrate.setText("开始校准");
-        btnCalibrate.setOnClickListener(v -> startCalibration());
+        btnCalibrate.setOnClickListener(v -> {
+            if (currentPhase == MeasurementPhase.MEASURING) {
+                clearCurrentMask();
+            } else {
+                startCalibration();
+            }
+        });
 
         btnMeasure = new Button(this);
         btnMeasure.setText("开始测量");
@@ -414,7 +424,8 @@ public class ObjectMeasurementActivity extends Activity {
         currentPhase = MeasurementPhase.CALIBRATING;
         stableCount = 0;
         baselineDepth = null;
-        savedBaseline = null;  // 清除已保存的基线
+        savedBaseline = null;
+        calibrationFrames = new ArrayList<>();
 
         runOnUiThread(() -> {
             btnCalibrate.setEnabled(false);
@@ -433,30 +444,28 @@ public class ObjectMeasurementActivity extends Activity {
             return;
         }
 
-        // 将原始数据转换为距离矩阵
         float[][] currentFrame = convertToDistanceMatrix(latestDepthData);
 
         if (baselineDepth == null) {
-            // 第一帧，直接保存
             baselineDepth = currentFrame;
+            calibrationFrames.add(currentFrame);
             stableCount = 1;
             updateCalibrationUI(1, 0);
         } else {
-            // 计算与上一帧的平均值差异
             float avgDiff = calculateAverageDifference(baselineDepth, currentFrame);
 
             if (avgDiff < BASELINE_AVG_THRESHOLD_MM) {
-                // 稳定
                 stableCount++;
+                calibrationFrames.add(currentFrame);
                 updateCalibrationUI(stableCount, avgDiff);
 
-                if (stableCount >= STABLE_COUNT_REQUIRED) {
-                    // 校准完成
+                if (stableCount >= STABLE_COUNT_CALIBRATE) {
                     finishCalibration();
                 }
             } else {
-                // 不稳定，重置计数，更新基线
                 baselineDepth = currentFrame;
+                calibrationFrames.clear();
+                calibrationFrames.add(currentFrame);
                 stableCount = 1;
                 updateCalibrationUI(1, avgDiff);
             }
@@ -468,7 +477,7 @@ public class ObjectMeasurementActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             sb.append("正在采集空桌面数据...\n");
             sb.append("请保持桌面清洁\n\n");
-            sb.append(String.format("稳定进度: %d/%d\n", count, STABLE_COUNT_REQUIRED));
+            sb.append(String.format("稳定进度: %d/%d\n", count, STABLE_COUNT_CALIBRATE));
             sb.append(String.format("帧间差异: %.2f mm (阈值: %.1f mm)\n", diff, BASELINE_AVG_THRESHOLD_MM));
             sb.append("\n当前深度统计:\n");
             sb.append(getDepthStatistics(baselineDepth));
@@ -477,13 +486,15 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void finishCalibration() {
-        // 保存已校准的基线（深拷贝，用于位置校验）
+        // 多帧平均作为最终基线，消除单帧噪声
+        baselineDepth = averageFrames(calibrationFrames);
+        int frameCount = calibrationFrames.size();
+        calibrationFrames = null;
+
         savedBaseline = copyDepthArray(baselineDepth);
 
-        // 计算中心区域(10x10)平均深度
         float centerDepth = calculateCenterDepth(baselineDepth);
 
-        // 保存基线到文件
         boolean saved = depthStorage.saveBaseline(baselineDepth);
 
         runOnUiThread(() -> {
@@ -494,13 +505,14 @@ public class ObjectMeasurementActivity extends Activity {
             statusText.setText("状态: 基线校准完成 ✓ (监控中)");
             StringBuilder sb = new StringBuilder();
             sb.append("══════ 基线校准完成 ══════\n\n");
-            sb.append(String.format("中心点深度: %.0f mm\n\n", centerDepth));
+            sb.append(String.format("中心点深度: %.0f mm\n", centerDepth));
+            sb.append(String.format("基线帧数: %d 帧平均\n\n", frameCount));
             sb.append("基线已保存到本地\n\n");
             sb.append("基线深度统计:\n");
             sb.append(getDepthStatistics(baselineDepth));
             sb.append("\n\n正在监控位置变化...");
             infoText.setText(sb.toString());
-            appendLog(String.format("基线校准完成，中心点深度: %.0f mm，开始监控位置变化", centerDepth));
+            appendLog(String.format("基线校准完成 (%d帧平均)，中心点深度: %.0f mm", frameCount, centerDepth));
         });
 
         // 不停止采样，切换到位置监控模式
@@ -589,14 +601,16 @@ public class ObjectMeasurementActivity extends Activity {
 
         currentPhase = MeasurementPhase.MEASURING;
         stableCount = 0;
-        lastVolume = 0;
+        lastWidth = 0; lastLength = 0; lastHeight = 0;
         lastResult = null;
+        noiseMask = null;
 
         runOnUiThread(() -> {
-            btnCalibrate.setEnabled(false);
+            btnCalibrate.setText("清除Mask");
+            btnCalibrate.setEnabled(true);
             btnMeasure.setEnabled(false);
             statusText.setText("状态: 物体测量中...");
-            infoText.setText(String.format("正在测量物体尺寸...\n\n请将物体放置在桌面上\n\n稳定进度: 0/%d", STABLE_COUNT_REQUIRED));
+            infoText.setText(String.format("正在测量物体尺寸...\n\n请先点 [清除Mask] 消除噪声，再放置物体\n\n稳定进度: 0/%d", STABLE_COUNT_MEASURE));
             appendLog("开始物体测量");
         });
 
@@ -612,64 +626,78 @@ public class ObjectMeasurementActivity extends Activity {
         // 将原始数据转换为距离矩阵
         currentDepth = convertToDistanceMatrix(latestDepthData);
 
-        // 使用 ObjectDimensionCalculator 计算
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
-                PIXEL_SIZE_X_MM, PIXEL_SIZE_Y_MM, OBJECT_THRESHOLD_MM
+                PIXEL_SIZE_X_MM, PIXEL_SIZE_Y_MM, OBJECT_THRESHOLD_MM, noiseMask
         );
 
         ObjectDimensionCalculator.DimensionResult result = calculator.calculate();
+        String maskStats = calculator.getMaskDepthDiffStats();
 
         if (result == null || "未检测到物体".equals(result.message)) {
             runOnUiThread(() -> {
-                infoText.setText("未检测到物体\n\n请将物体放置在桌面上");
+                StringBuilder sb = new StringBuilder();
+                sb.append("未检测到物体\n\n请将物体放置在桌面上\n\n");
+                sb.append(String.format("有效像素: %d (原始Mask: %d)\n\n",
+                        result.validPixelCount, result.rawPixelCount));
+                sb.append("───── Mask 诊断 ─────\n");
+                sb.append(maskStats);
+                infoText.setText(sb.toString());
             });
             stableCount = 0;
             return;
         }
 
-        // 计算体积 (mm³ -> cm³)
-        float volumeMm3 = result.width * result.length * result.height;
-        float volumeCm3 = volumeMm3 / 1000.0f;  // mm³ -> cm³
+        float diffW = Math.abs(result.width - lastWidth);
+        float diffL = Math.abs(result.length - lastLength);
+        float diffH = Math.abs(result.height - lastHeight);
+        float maxDimDiff = Math.max(diffW, Math.max(diffL, diffH));
 
-        // 检查体积稳定性
-        float volumeDiff = Math.abs(volumeCm3 - lastVolume);
-
-        if (volumeDiff < VOLUME_THRESHOLD_CM3) {
+        if (maxDimDiff < DIMENSION_THRESHOLD_MM) {
             stableCount++;
-            lastVolume = volumeCm3;  // 更新上一帧体积，用于下次比较
+            lastWidth = result.width;
+            lastLength = result.length;
+            lastHeight = result.height;
             lastResult = result;
 
             runOnUiThread(() -> {
-                updateMeasurementUI(result, volumeCm3, volumeDiff, stableCount);
+                updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStats);
             });
 
-            if (stableCount >= STABLE_COUNT_REQUIRED) {
+            if (stableCount >= STABLE_COUNT_MEASURE) {
+                float volumeMm3 = result.width * result.length * result.height;
+                float volumeCm3 = volumeMm3 / 1000.0f;
                 finishMeasurement(result, volumeCm3);
             }
         } else {
             stableCount = 1;
-            lastVolume = volumeCm3;
+            lastWidth = result.width;
+            lastLength = result.length;
+            lastHeight = result.height;
             lastResult = result;
 
             runOnUiThread(() -> {
-                updateMeasurementUI(result, volumeCm3, volumeDiff, 1);
+                updateMeasurementUI(result, diffW, diffL, diffH, 1, maskStats);
             });
         }
     }
 
     private void updateMeasurementUI(ObjectDimensionCalculator.DimensionResult result,
-                                     float volumeCm3, float volumeDiff, int count) {
+                                     float diffW, float diffL, float diffH,
+                                     int count, String maskStats) {
         StringBuilder sb = new StringBuilder();
         sb.append("正在测量物体尺寸...\n\n");
-        sb.append(String.format("稳定进度: %d/%d\n", count, STABLE_COUNT_REQUIRED));
-        sb.append(String.format("体积变化: %.1f cm³ (阈值: %.1f cm³)\n\n", volumeDiff, VOLUME_THRESHOLD_CM3));
+        sb.append(String.format("稳定进度: %d/%d (阈值: %.0fmm)\n", count, STABLE_COUNT_MEASURE, DIMENSION_THRESHOLD_MM));
+        sb.append(String.format("偏差: W:%.1f L:%.1f H:%.1fmm\n\n", diffW, diffL, diffH));
         sb.append("══════ 当前测量值 ══════\n");
         sb.append(String.format("宽(W): %.1f mm  (%.1f cm)\n", result.width, result.width / 10));
         sb.append(String.format("长(L): %.1f mm  (%.1f cm)\n", result.length, result.length / 10));
         sb.append(String.format("高(H): %.1f mm  (%.1f cm)\n", result.height, result.height / 10));
-        sb.append(String.format("厚(T): %.1f mm  (%.1f cm)\n", result.thickness, result.thickness / 10));
+        float volumeCm3 = result.width * result.length * result.height / 1000.0f;
         sb.append(String.format("体积: %.1f cm³\n", volumeCm3));
+        sb.append(String.format("有效像素: %d (原始Mask: %d)\n\n", result.validPixelCount, result.rawPixelCount));
+        sb.append("───── Mask 诊断 ─────\n");
+        sb.append(maskStats);
         infoText.setText(sb.toString());
     }
 
@@ -678,6 +706,7 @@ public class ObjectMeasurementActivity extends Activity {
 
         runOnUiThread(() -> {
             currentPhase = MeasurementPhase.MEASURED;
+            btnCalibrate.setText("开始校准");
             btnCalibrate.setEnabled(true);
             btnMeasure.setEnabled(true);
 
@@ -687,9 +716,9 @@ public class ObjectMeasurementActivity extends Activity {
             sb.append(String.format("宽(W): %.1f mm  (%.1f cm)\n", result.width, result.width / 10));
             sb.append(String.format("长(L): %.1f mm  (%.1f cm)\n", result.length, result.length / 10));
             sb.append(String.format("高(H): %.1f mm  (%.1f cm)\n", result.height, result.height / 10));
-            sb.append(String.format("厚(T): %.1f mm  (%.1f cm)\n", result.thickness, result.thickness / 10));
             sb.append("─────────────────────────\n");
             sb.append(String.format("体积: %.1f cm³\n", volumeCm3));
+            sb.append(String.format("有效像素: %d (原始Mask: %d)\n", result.validPixelCount, result.rawPixelCount));
             sb.append("═════════════════════════\n\n");
             sb.append("点击 [重置] 进行新测量");
             infoText.setText(sb.toString());
@@ -698,7 +727,66 @@ public class ObjectMeasurementActivity extends Activity {
         });
     }
 
+    /**
+     * 清除当前 Mask：用当前帧刷新 baselineDepth，消除噪声像素
+     */
+    private void clearCurrentMask() {
+        if (currentPhase != MeasurementPhase.MEASURING || latestDepthData == null || baselineDepth == null) {
+            return;
+        }
+
+        float[][] currentFrame = convertToDistanceMatrix(latestDepthData);
+        noiseMask = new boolean[100][100];
+        int noiseCount = 0;
+
+        for (int x = 0; x < 100; x++) {
+            for (int y = 0; y < 100; y++) {
+                float bDepth = baselineDepth[x][y];
+                float cDepth = currentFrame[x][y];
+                if (bDepth <= 0 || cDepth <= 0) {
+                    noiseMask[x][y] = true;
+                    noiseCount++;
+                } else if (bDepth - cDepth > OBJECT_THRESHOLD_MM) {
+                    noiseMask[x][y] = true;
+                    noiseCount++;
+                }
+            }
+        }
+
+        stableCount = 0;
+        lastWidth = 0; lastLength = 0; lastHeight = 0;
+
+        final int blocked = noiseCount;
+        runOnUiThread(() -> {
+            statusText.setText("状态: Mask已清除，请放置物体");
+            infoText.setText(String.format("已屏蔽 %d 个噪声像素\n\n现在请将物体放置在桌面上\n\n稳定进度: 0/%d", blocked, STABLE_COUNT_MEASURE));
+            appendLog(String.format("已清除Mask，屏蔽 %d 个噪声像素", blocked));
+        });
+    }
+
     // ==================== 辅助方法 ====================
+
+    /**
+     * 将多帧深度数据取平均，消除单帧噪声
+     */
+    private float[][] averageFrames(List<float[][]> frames) {
+        if (frames == null || frames.isEmpty()) return null;
+        int rows = frames.get(0).length;
+        int cols = frames.get(0)[0].length;
+        float[][] result = new float[rows][cols];
+        int frameCount = frames.size();
+
+        for (int x = 0; x < rows; x++) {
+            for (int y = 0; y < cols; y++) {
+                float sum = 0;
+                for (float[][] frame : frames) {
+                    sum += frame[x][y];
+                }
+                result[x][y] = sum / frameCount;
+            }
+        }
+        return result;
+    }
 
     private float[][] convertToDistanceMatrix(byte[] depthData) {
         float[][] matrix = new float[100][100];
@@ -761,16 +849,20 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void startSampling(Runnable sampleAction) {
-        sampleRunnable = new Runnable() {
+        stopSampling();
+        Runnable newRunnable = new Runnable() {
             @Override
             public void run() {
-                if (running) {
+                if (running && sampleRunnable == this) {
                     sampleAction.run();
-                    mainHandler.postDelayed(this, SAMPLE_INTERVAL_MS);
+                    if (sampleRunnable == this) {
+                        mainHandler.postDelayed(this, SAMPLE_INTERVAL_MS);
+                    }
                 }
             }
         };
-        mainHandler.post(sampleRunnable);
+        sampleRunnable = newRunnable;
+        mainHandler.post(newRunnable);
     }
 
     private void stopSampling() {
@@ -784,16 +876,18 @@ public class ObjectMeasurementActivity extends Activity {
         stopSampling();
         currentPhase = MeasurementPhase.IDLE;
         stableCount = 0;
-        lastVolume = 0;
+        lastWidth = 0; lastLength = 0; lastHeight = 0;
         lastResult = null;
         currentDepth = null;
         baselineDepth = null;
-        savedBaseline = null;  // 清除已保存的基线
+        savedBaseline = null;
+        noiseMask = null;
 
         // 删除保存的基线文件
         boolean deleted = depthStorage.deleteBaseline();
 
         runOnUiThread(() -> {
+            btnCalibrate.setText("开始校准");
             btnCalibrate.setEnabled(true);
             btnMeasure.setEnabled(false);
             statusText.setText("状态: 已重置");
