@@ -113,12 +113,25 @@ public class ObjectDimensionCalculator {
                 float bDepth = baselineDepth[x][y];
                 float cDepth = currentDepth[x][y];
 
+                // 1. 基本有效性检查
                 if (bDepth <= 0 || cDepth <= 0) {
                     mask[x][y] = 0;
                     continue;
                 }
 
+                // 2. baseline 值必须在合理范围内（比如 100-1000mm）
+                // 超出范围的像素可能是噪声
+                if (bDepth < 100 || bDepth > 1000) {
+                    mask[x][y] = 0;
+                    continue;
+                }
+
+                // 3. 深度差必须在合理范围内
                 float depthDiff = bDepth - cDepth;
+                if (depthDiff < 0 || depthDiff > 800) {
+                    mask[x][y] = 0;
+                    continue;
+                }
 
                 if (depthDiff > threshold) {
                     mask[x][y] = 1;

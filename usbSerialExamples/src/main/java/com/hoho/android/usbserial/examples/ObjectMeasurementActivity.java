@@ -50,13 +50,20 @@ public class ObjectMeasurementActivity extends Activity {
     private static final int STABLE_COUNT_MEASURE = 10;   // 测量: 连续10次稳定 = 5秒
 
     // 稳定性阈值
-    private static final float BASELINE_AVG_THRESHOLD_MM = 60.0f;  // 基线平均值差异阈值 (mm)
+    private static final float BASELINE_AVG_THRESHOLD_MM = 20.0f;  // 基线平均值差异阈值 (mm)
     private static final float POSITION_CHANGE_THRESHOLD_MM = 100.0f;  // 位置变化阈值 (mm)
     private static final float DIMENSION_THRESHOLD_MM = 20.0f;     // 长宽高各维度偏差阈值 (mm)
 
-    // ObjectDimensionCalculator 参数 (基于 FOV 70°×60°, 中心距离 285mm 计算)
-    private static final float PIXEL_SIZE_X_MM = 4.0f;  // 水平: 2*285*tan(35°)/100
-    private static final float PIXEL_SIZE_Y_MM = 3.3f;  // 垂直: 2*285*tan(30°)/100
+    // FOV 参数 (A010: 70°×60°)
+    private static final double FOV_HORIZONTAL_DEG = 70.0;  // 水平视场角
+    private static final double FOV_VERTICAL_DEG = 60.0;    // 垂直视场角
+    private static final double TAN_FOV_H_HALF = Math.tan(Math.toRadians(FOV_HORIZONTAL_DEG / 2));  // tan(35°)
+    private static final double TAN_FOV_V_HALF = Math.tan(Math.toRadians(FOV_VERTICAL_DEG / 2));    // tan(30°)
+
+    // 动态计算的像素尺寸 (根据校准时的深度)
+    private float pixelSizeX;  // 水平方向每像素对应的 mm
+    private float pixelSizeY;  // 垂直方向每像素对应的 mm
+
     private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (考虑噪声余量)
 
     // 串口
@@ -89,6 +96,11 @@ public class ObjectMeasurementActivity extends Activity {
     private ObjectDimensionCalculator.DimensionResult lastResult;
     private float lastWidth = 0, lastLength = 0, lastHeight = 0;
     private int stableCount = 0;
+
+    // 稳定帧累积 (用于取平均值)
+    private List<Float> stableWidths = new ArrayList<>();
+    private List<Float> stableLengths = new ArrayList<>();
+    private List<Float> stableHeights = new ArrayList<>();
 
     // UI
     private TextView statusText;
@@ -495,6 +507,13 @@ public class ObjectMeasurementActivity extends Activity {
 
         float centerDepth = calculateCenterDepth(baselineDepth);
 
+        // 根据当前校准深度动态计算像素尺寸
+        // 像素宽度 = 2 × depth × tan(FOV_H/2) / 100
+        // 像素高度 = 2 × depth × tan(FOV_V/2) / 100
+        double depthMm = centerDepth;
+        pixelSizeX = (float) (2.0 * depthMm * TAN_FOV_H_HALF / 100.0);
+        pixelSizeY = (float) (2.0 * depthMm * TAN_FOV_V_HALF / 100.0);
+
         boolean saved = depthStorage.saveBaseline(baselineDepth);
 
         runOnUiThread(() -> {
@@ -506,13 +525,15 @@ public class ObjectMeasurementActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             sb.append("══════ 基线校准完成 ══════\n\n");
             sb.append(String.format("中心点深度: %.0f mm\n", centerDepth));
+            sb.append(String.format("像素尺寸: X=%.2f mm, Y=%.2f mm\n", pixelSizeX, pixelSizeY));
             sb.append(String.format("基线帧数: %d 帧平均\n\n", frameCount));
             sb.append("基线已保存到本地\n\n");
             sb.append("基线深度统计:\n");
             sb.append(getDepthStatistics(baselineDepth));
             sb.append("\n\n正在监控位置变化...");
             infoText.setText(sb.toString());
-            appendLog(String.format("基线校准完成 (%d帧平均)，中心点深度: %.0f mm", frameCount, centerDepth));
+            appendLog(String.format("基线校准完成 (%d帧平均)，中心点深度: %.0f mm，像素尺寸: X=%.2f Y=%.2f mm",
+                    frameCount, centerDepth, pixelSizeX, pixelSizeY));
         });
 
         // 不停止采样，切换到位置监控模式
@@ -530,6 +551,18 @@ public class ObjectMeasurementActivity extends Activity {
             copy[i] = source[i].clone();
         }
         return copy;
+    }
+
+    /**
+     * 计算列表中数值的平均值
+     */
+    private float average(List<Float> values) {
+        if (values == null || values.isEmpty()) return 0;
+        float sum = 0;
+        for (float v : values) {
+            sum += v;
+        }
+        return sum / values.size();
     }
 
     /**
@@ -604,6 +637,9 @@ public class ObjectMeasurementActivity extends Activity {
         lastWidth = 0; lastLength = 0; lastHeight = 0;
         lastResult = null;
         noiseMask = null;
+        stableWidths.clear();
+        stableLengths.clear();
+        stableHeights.clear();
 
         runOnUiThread(() -> {
             btnCalibrate.setText("清除Mask");
@@ -628,7 +664,7 @@ public class ObjectMeasurementActivity extends Activity {
 
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
-                PIXEL_SIZE_X_MM, PIXEL_SIZE_Y_MM, OBJECT_THRESHOLD_MM, noiseMask
+                pixelSizeX, pixelSizeY, OBJECT_THRESHOLD_MM, noiseMask
         );
 
         ObjectDimensionCalculator.DimensionResult result = calculator.calculate();
@@ -660,14 +696,31 @@ public class ObjectMeasurementActivity extends Activity {
             lastHeight = result.height;
             lastResult = result;
 
+            // 累积稳定帧数据
+            stableWidths.add(result.width);
+            stableLengths.add(result.length);
+            stableHeights.add(result.height);
+
             runOnUiThread(() -> {
                 updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStats);
             });
 
             if (stableCount >= STABLE_COUNT_MEASURE) {
-                float volumeMm3 = result.width * result.length * result.height;
+                // 计算稳定帧的平均值
+                float avgWidth = average(stableWidths);
+                float avgLength = average(stableLengths);
+                float avgHeight = average(stableHeights);
+                float volumeMm3 = avgWidth * avgLength * avgHeight;
                 float volumeCm3 = volumeMm3 / 1000.0f;
-                finishMeasurement(result, volumeCm3);
+
+                // 创建平均结果
+                ObjectDimensionCalculator.DimensionResult avgResult =
+                    new ObjectDimensionCalculator.DimensionResult(
+                        avgWidth, avgLength, avgHeight,
+                        result.rawPixelCount, result.validPixelCount,
+                        "测量完成 (" + STABLE_COUNT_MEASURE + "帧平均)"
+                    );
+                finishMeasurement(avgResult, volumeCm3);
             }
         } else {
             stableCount = 1;
@@ -675,6 +728,14 @@ public class ObjectMeasurementActivity extends Activity {
             lastLength = result.length;
             lastHeight = result.height;
             lastResult = result;
+
+            // 重新开始累积
+            stableWidths.clear();
+            stableLengths.clear();
+            stableHeights.clear();
+            stableWidths.add(result.width);
+            stableLengths.add(result.length);
+            stableHeights.add(result.height);
 
             runOnUiThread(() -> {
                 updateMeasurementUI(result, diffW, diffL, diffH, 1, maskStats);
@@ -813,10 +874,18 @@ public class ObjectMeasurementActivity extends Activity {
             for (int y = 0; y < frame1[x].length; y++) {
                 float v1 = frame1[x][y];
                 float v2 = frame2[x][y];
-                if (v1 > 0 && v2 > 0) {  // 忽略无效值
-                    totalDiff += Math.abs(v1 - v2);
-                    count++;
-                }
+
+                // 忽略无效值和异常值
+                if (v1 <= 0 || v2 <= 0) continue;
+                if (v1 < 100 || v1 > 1000) continue;  // 过滤异常值
+                if (v2 < 100 || v2 > 1000) continue;  // 过滤异常值
+
+                // 过滤单点差异过大的（噪声像素通常差异很大）
+                float diff = Math.abs(v1 - v2);
+                if (diff > 500) continue;  // 单点差异超过 500mm 视为噪声
+
+                totalDiff += diff;
+                count++;
             }
         }
 
@@ -882,6 +951,9 @@ public class ObjectMeasurementActivity extends Activity {
         baselineDepth = null;
         savedBaseline = null;
         noiseMask = null;
+        stableWidths.clear();
+        stableLengths.clear();
+        stableHeights.clear();
 
         // 删除保存的基线文件
         boolean deleted = depthStorage.deleteBaseline();
