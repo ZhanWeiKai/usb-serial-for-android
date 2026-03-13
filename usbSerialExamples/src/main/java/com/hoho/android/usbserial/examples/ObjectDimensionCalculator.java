@@ -38,6 +38,9 @@ public class ObjectDimensionCalculator {
     private int xMin, xMax, yMin, yMax;  // 投影后的有效范围
     private int objectPixelCount;        // mask=1 原始像素数
     private int validPixelCount;         // 投影过滤后的有效像素数
+    private int maxDiffX = -1, maxDiffY = -1; // 最大深度差对应的坐标
+    private float maxDiffBaselineDepth = 0;   // 最大深度差点的 baseline 深度
+    private float maxDiffCurrentDepth = 0;    // 最大深度差点的 current 深度
 
     /**
      * 构造函数
@@ -197,7 +200,13 @@ public class ObjectDimensionCalculator {
                 if (mask[x][y] == 1) {
                     validPixelCount++;
                     float diff = baselineDepth[x][y] - currentDepth[x][y];
-                    if (diff > maxDepthDiff) maxDepthDiff = diff;
+                    if (diff > maxDepthDiff) {
+                        maxDepthDiff = diff;
+                        maxDiffX = x;
+                        maxDiffY = y;
+                        maxDiffBaselineDepth = baselineDepth[x][y];
+                        maxDiffCurrentDepth = currentDepth[x][y];
+                    }
                 }
             }
         }
@@ -294,6 +303,11 @@ public class ObjectDimensionCalculator {
             sb.append(String.format("有效行范围: y[%d-%d] (%d行)\n", yMin, yMax, yMax - yMin + 1));
         }
         sb.append("───────────────────\n");
+        if (maxDiffX >= 0 && maxDiffY >= 0) {
+            float maxDiff = maxDiffBaselineDepth - maxDiffCurrentDepth;
+            sb.append(String.format("最高点: (x=%d,y=%d) baseline=%.0f mm, current=%.0f mm, diff=%.0f mm\n",
+                    maxDiffX, maxDiffY, maxDiffBaselineDepth, maxDiffCurrentDepth, maxDiff));
+        }
         sb.append(String.format("宽度 W: %.1f mm\n", width));
         sb.append(String.format("长度 L: %.1f mm\n", length));
         sb.append(String.format("高度 H: %.1f mm (cos45°校正)\n", height));
@@ -304,6 +318,9 @@ public class ObjectDimensionCalculator {
     // ==================== Getters ====================
 
     public int[][] getMask() { return mask; }
+    public int[] getColCount() { return colCount; }
+    public int[] getRowCount() { return rowCount; }
+    public int getMinProjectionCount() { return MIN_PROJECTION_COUNT; }
     public float getWidth() { return width; }
     public float getLength() { return length; }
     public float getHeight() { return height; }
@@ -313,6 +330,29 @@ public class ObjectDimensionCalculator {
     public int getXMax() { return xMax; }
     public int getYMin() { return yMin; }
     public int getYMax() { return yMax; }
+    public int getMaxDiffX() { return maxDiffX; }
+    public int getMaxDiffY() { return maxDiffY; }
+    public float getMaxDiffBaselineDepth() { return maxDiffBaselineDepth; }
+    public float getMaxDiffCurrentDepth() { return maxDiffCurrentDepth; }
+
+    /**
+     * 判断指定位置是否为有效像素（经过行列投影过滤）
+     */
+    public boolean isValidPixel(int x, int y) {
+        if (mask[x][y] != 1) return false;
+        if (colCount == null || rowCount == null) return false;
+        return colCount[x] >= MIN_PROJECTION_COUNT && rowCount[y] >= MIN_PROJECTION_COUNT;
+    }
+
+    /**
+     * 获取指定位置的深度差
+     */
+    public float getDepthDiffAt(int x, int y) {
+        if (x < 0 || x >= baselineDepth.length || y < 0 || y >= baselineDepth[0].length) {
+            return 0;
+        }
+        return baselineDepth[x][y] - currentDepth[x][y];
+    }
 
     /**
      * 计算结果封装类

@@ -1,6 +1,7 @@
 package com.hoho.android.usbserial.examples;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.hardware.usb.UsbDeviceConnection;
@@ -11,6 +12,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -112,6 +114,12 @@ public class ObjectMeasurementActivity extends Activity {
     private Button btnMeasure;
     private Button btnReset;
 
+    // 差异热力图
+    private ImageView imgDiffHeatmap;
+    private Bitmap diffBitmap;
+    private int[] diffPixels;  // 长度 100*100
+    private TextView peakDepthText;      // 显示最高点 baseline/current/diff
+
     // 定时器
     private Handler mainHandler;
     private Runnable sampleRunnable;
@@ -135,10 +143,21 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void createLayout() {
+        // 根布局：水平，左边内容，右边热力图
         LinearLayout rootLayout = new LinearLayout(this);
-        rootLayout.setOrientation(LinearLayout.VERTICAL);
+        rootLayout.setOrientation(LinearLayout.HORIZONTAL);
         rootLayout.setBackgroundColor(Color.parseColor("#1E1E1E"));
         rootLayout.setPadding(16, 16, 16, 16);
+
+        // ===== 左侧面板：原来的内容 =====
+        LinearLayout leftPanel = new LinearLayout(this);
+        leftPanel.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams leftParams = new LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                1.0f
+        );
+        leftPanel.setLayoutParams(leftParams);
 
         // 状态区域
         statusText = new TextView(this);
@@ -225,11 +244,66 @@ public class ObjectMeasurementActivity extends Activity {
         buttonLayout.addView(btnMeasure);
         buttonLayout.addView(btnReset);
 
-        rootLayout.addView(statusText);
-        rootLayout.addView(frameStatsText);
-        rootLayout.addView(infoText);
-        rootLayout.addView(scrollView);
-        rootLayout.addView(buttonLayout);
+        leftPanel.addView(statusText);
+        leftPanel.addView(frameStatsText);
+        leftPanel.addView(infoText);
+        leftPanel.addView(scrollView);
+        leftPanel.addView(buttonLayout);
+
+        // ===== 右侧面板：热力图 =====
+        LinearLayout rightPanel = new LinearLayout(this);
+        rightPanel.setOrientation(LinearLayout.VERTICAL);
+        rightPanel.setPadding(16, 0, 0, 0);
+        LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+        );
+        rightPanel.setLayoutParams(rightParams);
+
+        // 热力图标题
+        TextView heatmapTitle = new TextView(this);
+        heatmapTitle.setTextColor(Color.parseColor("#888888"));
+        heatmapTitle.setTextSize(11);
+        heatmapTitle.setTypeface(Typeface.MONOSPACE);
+        heatmapTitle.setText("差异热力图");
+        heatmapTitle.setPadding(0, 0, 0, 8);
+
+        // 热力图 ImageView
+        imgDiffHeatmap = new ImageView(this);
+        LinearLayout.LayoutParams heatmapParams = new LinearLayout.LayoutParams(300, 300);
+        imgDiffHeatmap.setLayoutParams(heatmapParams);
+        imgDiffHeatmap.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        imgDiffHeatmap.setBackgroundColor(Color.parseColor("#101010"));
+
+        // 初始化 Bitmap
+        diffBitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888);
+        diffPixels = new int[100 * 100];
+        imgDiffHeatmap.setImageBitmap(diffBitmap);
+
+        // 最高点深度 TextView（放在热力图下方）
+        peakDepthText = new TextView(this);
+        peakDepthText.setTextColor(Color.parseColor("#CCCCCC"));
+        peakDepthText.setTextSize(10);
+        peakDepthText.setTypeface(Typeface.MONOSPACE);
+        peakDepthText.setPadding(0, 8, 0, 0);
+        peakDepthText.setText("最高点: -");
+
+        // 颜色图例
+        TextView legendText = new TextView(this);
+        legendText.setTextColor(Color.parseColor("#888888"));
+        legendText.setTextSize(9);
+        legendText.setTypeface(Typeface.MONOSPACE);
+        legendText.setText("蓝=低  →  红=高");
+        legendText.setPadding(0, 8, 0, 0);
+
+        rightPanel.addView(heatmapTitle);
+        rightPanel.addView(imgDiffHeatmap);
+        rightPanel.addView(peakDepthText);
+        rightPanel.addView(legendText);
+
+        // 组装根布局
+        rootLayout.addView(leftPanel);
+        rootLayout.addView(rightPanel);
         setContentView(rootLayout);
     }
 
@@ -556,6 +630,96 @@ public class ObjectMeasurementActivity extends Activity {
     /**
      * 计算列表中数值的平均值
      */
+    // ==================== 差异热力图 ====================
+
+    /**
+     * 将深度差映射为颜色
+     * - diff < threshold → 深灰背景
+     * - diff ∈ [threshold, threshold+150] → 蓝→红渐变
+     * - diff > threshold+150 → 饱和红
+     */
+    private int mapDiffToColor(float diff, float threshold) {
+        if (diff <= threshold) {
+            // 背景：深灰
+            return 0xFF202020;
+        }
+        float maxExtra = 150f; // 超过 150mm 的都按 150 算
+        float extra = Math.min(diff - threshold, maxExtra);
+        float t = extra / maxExtra; // 0..1
+
+        // 从蓝(0,0,255) → 红(255,0,0) 线性插值
+        int r = (int) (255 * t);
+        int g = 0;
+        int b = (int) (255 * (1 - t));
+
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    /**
+     * 更新差异热力图 - 只显示有效像素
+     */
+    private void updateDiffHeatmap(ObjectDimensionCalculator calculator) {
+        int width = 100;
+        int height = 100;
+
+        int[][] mask = calculator.getMask();
+        int[] colCount = calculator.getColCount();
+        int[] rowCount = calculator.getRowCount();
+        int minProjCount = calculator.getMinProjectionCount();
+
+        // 最高点坐标（最大深度差点）
+        int peakX = calculator.getMaxDiffX();
+        int peakY = calculator.getMaxDiffY();
+
+        // 注意：传感器内部使用的是 [x][y] = [列][行]，
+        // 而 Bitmap 使用的是 (x=水平, y=垂直)。
+        // 这里显式以 Bitmap 的 (x,y) 为主坐标，按行主序填充 diffPixels。
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                // 将 Bitmap 坐标 (x,y) 映射到传感器数据坐标 (dataX,dataY)。
+                // 如需旋转方向，只在这里调整映射关系，其他逻辑不受影响。
+                int dataX = x;
+                int dataY = y;
+
+                int idx = y * width + x;
+
+                // 只显示有效像素：mask=1 且行列投影都满足阈值
+                if (mask[dataX][dataY] == 1 &&
+                    colCount[dataX] >= minProjCount &&
+                    rowCount[dataY] >= minProjCount) {
+                    float diff = calculator.getDepthDiffAt(dataX, dataY);
+                    diffPixels[idx] = mapDiffToColor(diff, OBJECT_THRESHOLD_MM);
+                } else {
+                    // 背景像素：深灰
+                    diffPixels[idx] = 0xFF101010;
+                }
+            }
+        }
+
+        // 在最高点位置画一个“X”形标记（使用亮紫色），方便肉眼识别
+        if (peakX >= 0 && peakY >= 0 &&
+                peakX < width && peakY < height) {
+            int crossColor = 0xFFFF00FF; // 亮紫色
+            int arm = 2; // 叉叉臂长（像素）
+            for (int dy = -arm; dy <= arm; dy++) {
+                for (int dx = -arm; dx <= arm; dx++) {
+                    // 画对角线: abs(dx) == abs(dy)
+                    if (Math.abs(dx) != Math.abs(dy)) continue;
+                    int xx = peakX + dx;
+                    int yy = peakY + dy;
+                    if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+                    int idx = yy * width + xx;
+                    diffPixels[idx] = crossColor;
+                }
+            }
+        }
+
+        // 把像素数组刷进 Bitmap
+        diffBitmap.setPixels(diffPixels, 0, width, 0, 0, width, height);
+        // 请求重绘
+        runOnUiThread(() -> imgDiffHeatmap.invalidate());
+    }
+
     private float average(List<Float> values) {
         if (values == null || values.isEmpty()) return 0;
         float sum = 0;
@@ -668,7 +832,34 @@ public class ObjectMeasurementActivity extends Activity {
         );
 
         ObjectDimensionCalculator.DimensionResult result = calculator.calculate();
+
+        // 获取最高点的深度信息，方便在界面上展示
+        int peakX = calculator.getMaxDiffX();
+        int peakY = calculator.getMaxDiffY();
+        float peakBaseline = calculator.getMaxDiffBaselineDepth();
+        float peakCurrent = calculator.getMaxDiffCurrentDepth();
+        float peakDiff = peakBaseline - peakCurrent;
+
         String maskStats = calculator.getMaskDepthDiffStats();
+        if (peakX >= 0 && peakY >= 0) {
+            maskStats += String.format(
+                    "\n最高点: (x=%d,y=%d) baseline=%.0f mm, current=%.0f mm, diff=%.0f mm\n",
+                    peakX, peakY, peakBaseline, peakCurrent, peakDiff);
+        }
+        final String maskStatsFinal = maskStats;
+
+        // 更新右侧最高点 TextView
+        if (peakX >= 0 && peakY >= 0) {
+            final String peakText = String.format(
+                    "最高点: (x=%d,y=%d)\nbaseline=%.0f mm\ncurrent=%.0f mm\n差值=%.0f mm",
+                    peakX, peakY, peakBaseline, peakCurrent, peakDiff);
+            runOnUiThread(() -> peakDepthText.setText(peakText));
+        } else {
+            runOnUiThread(() -> peakDepthText.setText("最高点: -"));
+        }
+
+        // 更新差异热力图
+        updateDiffHeatmap(calculator);
 
         if (result == null || "未检测到物体".equals(result.message)) {
             runOnUiThread(() -> {
@@ -677,7 +868,7 @@ public class ObjectMeasurementActivity extends Activity {
                 sb.append(String.format("有效像素: %d (原始Mask: %d)\n\n",
                         result.validPixelCount, result.rawPixelCount));
                 sb.append("───── Mask 诊断 ─────\n");
-                sb.append(maskStats);
+                sb.append(maskStatsFinal);
                 infoText.setText(sb.toString());
             });
             stableCount = 0;
@@ -702,7 +893,7 @@ public class ObjectMeasurementActivity extends Activity {
             stableHeights.add(result.height);
 
             runOnUiThread(() -> {
-                updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStats);
+                updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStatsFinal);
             });
 
             if (stableCount >= STABLE_COUNT_MEASURE) {
@@ -738,7 +929,7 @@ public class ObjectMeasurementActivity extends Activity {
             stableHeights.add(result.height);
 
             runOnUiThread(() -> {
-                updateMeasurementUI(result, diffW, diffL, diffH, 1, maskStats);
+                updateMeasurementUI(result, diffW, diffL, diffH, 1, maskStatsFinal);
             });
         }
     }
