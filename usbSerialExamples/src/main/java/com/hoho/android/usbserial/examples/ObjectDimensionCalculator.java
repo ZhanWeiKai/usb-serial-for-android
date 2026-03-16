@@ -16,7 +16,10 @@ import android.util.Log;
 public class ObjectDimensionCalculator {
 
     private static final String TAG = "DimensionCalc";
-    private static final int MIN_PROJECTION_COUNT = 20; // 行/列至少需要的 mask=1 像素数
+    private static final int MIN_PROJECTION_COUNT_ABSOLUTE = 10; // 绝对最小阈值（防止噪声）
+    private static final float PROJECTION_THRESHOLD_RATIO = 0.7f; // 动态阈值 = maxCount * ratio
+    private int dynamicThresholdX = MIN_PROJECTION_COUNT_ABSOLUTE; // X方向动态阈值
+    private int dynamicThresholdY = MIN_PROJECTION_COUNT_ABSOLUTE; // Y方向动态阈值
 
     // 45° 旋转相关常量
     private static final double TILT_ANGLE_DEG = 45.0;
@@ -116,9 +119,120 @@ public class ObjectDimensionCalculator {
     }
 
     /**
-     * Step 1: 生成物体 mask
+     * 使用校准比例计算物体尺寸（推荐方法）
+     *
+     * 原理：校准时确定了像素-物理尺寸的比例，测量时直接用这个比例计算。
+     * 这种方法比 3D 变换更准确，因为避免了深度测量的系统误差。
+     *
+     * @param pixelSizeX X方向每像素对应的物理尺寸 (mm/像素)
+     * @param pixelSizeY Y方向每像素对应的物理尺寸 (mm/像素)
+     * @return 尺寸计算结果
      */
-    private void generateMask() {
+    public DimensionResult calculateDimensionsByCalibratedRatio(float pixelSizeX, float pixelSizeY) {
+        // Step 1: 生成物体 mask
+        generateMask();
+
+        if (objectPixelCount == 0) {
+            return new DimensionResult(0, 0, 0, 0, 0, "未检测到物体", -1, -1, -1, -1);
+        }
+
+        // Step 2: 行列投影
+        calculateProjection();
+
+        // 检查投影结果是否有效
+        if (xMin < 0 || yMin < 0) {
+            return new DimensionResult(0, 0, 0, objectPixelCount, 0, "投影范围无效", xMin, xMax, yMin, yMax);
+        }
+
+        // Step 3: 计算有效像素数
+        validPixelCount = 0;
+        for (int x = xMin; x <= xMax; x++) {
+            if (colCount[x] < dynamicThresholdX) continue;
+            for (int y = yMin; y <= yMax; y++) {
+                if (rowCount[y] < dynamicThresholdY) continue;
+                if (mask[x][y] == 1) {
+                    validPixelCount++;
+                }
+            }
+        }
+
+        if (validPixelCount == 0) {
+            return new DimensionResult(0, 0, 0, objectPixelCount, 0, "有效像素为空", xMin, xMax, yMin, yMax);
+        }
+
+        // Step 4: 使用校准比例计算长宽
+        int xSpan = xMax - xMin + 1;
+        int ySpan = yMax - yMin + 1;
+
+        width = xSpan * pixelSizeX;
+        length = ySpan * pixelSizeY;
+
+        // Step 5: 高度仍用深度差异法
+        calculateHeightByDepthDiff();
+
+        Log.d(TAG, String.format(
+                "═══ 校准比例计算结果 ═══\n" +
+                "像素跨度: X=%d, Y=%d\n" +
+                "校准比例: pixelSizeX=%.2f, pixelSizeY=%.2f mm/像素\n" +
+                "计算结果: W=%.1fmm, L=%.1fmm, H=%.1fmm",
+                xSpan, ySpan, pixelSizeX, pixelSizeY, width, length, height
+        ));
+
+        return new DimensionResult(width, length, height, objectPixelCount, validPixelCount,
+                "计算成功(校准比例)", xMin, xMax, yMin, yMax);
+    }
+
+    /**
+     * 使用深度差异计算高度
+     */
+    private void calculateHeightByDepthDiff() {
+        float maxDepthDiff = 0;
+
+        for (int x = xMin; x <= xMax; x++) {
+            if (colCount[x] < dynamicThresholdX) continue;
+            for (int y = yMin; y <= yMax; y++) {
+                if (rowCount[y] < dynamicThresholdY) continue;
+                if (mask[x][y] != 1) continue;
+
+                float diff = baselineDepth[x][y] - currentDepth[x][y];
+                if (diff > maxDepthDiff) {
+                    maxDepthDiff = diff;
+                }
+            }
+        }
+
+        // 高度 = 最大深度差 × cos(45°)
+        height = maxDepthDiff * (float) COS_TILT;
+        if (height < 0) height = 0;
+    }
+
+    /**
+     * 仅计算行列投影（供多帧中值滤波使用）
+     *
+     * 在 generateMask() 后调用，只计算 colCount/rowCount，
+     * 不做边界检测，用于获取原始投影数据
+     */
+    public void calculateProjectionOnly() {
+        int cols = baselineDepth.length;
+        int rows = baselineDepth[0].length;
+
+        colCount = new int[cols];
+        rowCount = new int[rows];
+
+        for (int x = 0; x < cols; x++) {
+            for (int y = 0; y < rows; y++) {
+                if (mask[x][y] == 1) {
+                    colCount[x]++;
+                    rowCount[y]++;
+                }
+            }
+        }
+    }
+
+    /**
+     * 生成mask（公开方法，供外部调用）
+     */
+    public void generateMask() {
         int cols = baselineDepth.length;
         int rows = baselineDepth[0].length;
 
@@ -164,9 +278,42 @@ public class ObjectDimensionCalculator {
     }
 
     /**
-     * Step 2: 行列投影过滤噪声
+     * 获取colCount数组（用于多帧中值滤波）
      */
-    private void calculateProjection() {
+    public int[] getColCount() {
+        if (colCount == null) return null;
+        return colCount.clone();
+    }
+
+    /**
+     * 获取rowCount数组（用于多帧中值滤波）
+     */
+    public int[] getRowCount() {
+        if (rowCount == null) return null;
+        return rowCount.clone();
+    }
+
+    /**
+     * 使用中值数据计算尺寸（支持多帧中值滤波）
+     *
+     * @param pixelSizeX X方向每像素对应的物理尺寸 (mm/像素)
+     * @param pixelSizeY Y方向每像素对应的物理尺寸 (mm/像素)
+     * @param medianColCount 中值滤波后的colCount
+     * @param medianRowCount 中值滤波后的rowCount
+     * @return 尺寸计算结果
+     */
+    public DimensionResult calculateDimensionsByCalibratedRatioWithMedianData(
+            float pixelSizeX, float pixelSizeY,
+            int[] medianColCount, int[] medianRowCount) {
+
+        // Step 1: 生成物体 mask
+        generateMask();
+
+        if (objectPixelCount == 0) {
+            return new DimensionResult(0, 0, 0, 0, 0, "未检测到物体", -1, -1, -1, -1);
+        }
+
+        // Step 2: 计算原始投影（用于计算dynamicThreshold）
         int cols = baselineDepth.length;
         int rows = baselineDepth[0].length;
 
@@ -176,19 +323,132 @@ public class ObjectDimensionCalculator {
         for (int x = 0; x < cols; x++) {
             for (int y = 0; y < rows; y++) {
                 if (mask[x][y] == 1) {
+                colCount[x]++;
+                rowCount[y]++;
+            }
+        }
+        }
+
+        // 计算动态阈值（保留兼容性）
+        int maxColCount = 0, maxRowCount = 0;
+        for (int x = 0; x < cols; x++) {
+            if (colCount[x] > maxColCount) maxColCount = colCount[x];
+        }
+        for (int y = 0; y < rows; y++) {
+            if (rowCount[y] > maxRowCount) maxRowCount = rowCount[y];
+        }
+
+        dynamicThresholdX = Math.max(MIN_PROJECTION_COUNT_ABSOLUTE,
+                (int)(maxColCount * PROJECTION_THRESHOLD_RATIO));
+        dynamicThresholdY = Math.max(MIN_PROJECTION_COUNT_ABSOLUTE,
+                (int)(maxRowCount * PROJECTION_THRESHOLD_RATIO));
+
+        // 验证中值数据有效性
+        if (medianColCount == null || medianRowCount == null ||
+            medianColCount.length < cols || medianRowCount.length < rows) {
+            return new DimensionResult(0, 0, 0, objectPixelCount, 0, "中值数据无效", -1, -1, -1, -1);
+        }
+
+        // Step 3: 使用中值数据进行梯度检测
+        int[] colRange = findEdgeByGradient(medianColCount, cols);
+        xMin = colRange[0];
+        xMax = colRange[1];
+
+        int[] rowRange = findEdgeByGradient(medianRowCount, rows);
+        yMin = rowRange[0];
+        yMax = rowRange[1];
+
+        // 检查投影结果是否有效
+        if (xMin < 0 || yMin < 0) {
+            return new DimensionResult(0, 0, 0, objectPixelCount, 0, "投影范围无效", xMin, xMax, yMin, yMax);
+        }
+
+        // Step 4: 计算有效像素数
+        validPixelCount = 0;
+        for (int x = xMin; x <= xMax; x++) {
+            if (colCount[x] < dynamicThresholdX) continue;
+            for (int y = yMin; y <= yMax; y++) {
+                if (rowCount[y] < dynamicThresholdY) continue;
+                if (mask[x][y] == 1) {
+                    validPixelCount++;
+                }
+            }
+        }
+
+        if (validPixelCount == 0) {
+            return new DimensionResult(0, 0, 0, objectPixelCount, 0, "有效像素为空", xMin, xMax, yMin, yMax);
+        }
+
+        // Step 5: 使用校准比例计算长宽
+        int xSpan = xMax - xMin + 1;
+        int ySpan = yMax - yMin + 1;
+
+        width = xSpan * pixelSizeX;
+        length = ySpan * pixelSizeY;
+
+        // Step 6: 高度仍用深度差异法
+        calculateHeightByDepthDiff();
+
+        Log.d(TAG, String.format(
+                "═══ 校准比例计算结果(中值滤波) ═══\n" +
+                "像素跨度: X=%d, Y=%d\n" +
+                "校准比例: pixelSizeX=%.2f, pixelSizeY=%.2f mm/像素\n" +
+                "计算结果: W=%.1fmm, L=%.1fmm, H=%.1fmm",
+                xSpan, ySpan, pixelSizeX, pixelSizeY, width, length, height
+        ));
+
+        return new DimensionResult(width, length, height, objectPixelCount, validPixelCount,
+                "计算成功(校准比例+中值滤波)", xMin, xMax, yMin, yMax);
+    }
+
+    /**
+     * 计算行列投影（用于噪声过滤）
+     *
+     * colCount[x] = 第x列有多少个mask=1的像素
+     * rowCount[y] = 第y行有多少个mask=1的像素
+     */
+    private void calculateProjection() {
+        int cols = baselineDepth.length;
+        int rows = baselineDepth[0].length;
+
+        colCount = new int[cols];
+        rowCount = new int[rows];
+
+        // 计算投影
+        for (int x = 0; x < cols; x++) {
+            for (int y = 0; y < rows; y++) {
+                if (mask[x][y] == 1) {
                     colCount[x]++;
                     rowCount[y]++;
                 }
             }
         }
 
-        int[] colRange = findLongestRun(colCount, cols);
+        // 计算动态阈值
+        int maxColCount = 0, maxRowCount = 0;
+        for (int x = 0; x < cols; x++) {
+            if (colCount[x] > maxColCount) maxColCount = colCount[x];
+        }
+        for (int y = 0; y < rows; y++) {
+            if (rowCount[y] > maxRowCount) maxRowCount = rowCount[y];
+        }
+
+        dynamicThresholdX = Math.max(MIN_PROJECTION_COUNT_ABSOLUTE,
+                (int)(maxColCount * PROJECTION_THRESHOLD_RATIO));
+        dynamicThresholdY = Math.max(MIN_PROJECTION_COUNT_ABSOLUTE,
+                (int)(maxRowCount * PROJECTION_THRESHOLD_RATIO));
+
+        // 使用梯度法检测边界
+        int[] colRange = findEdgeByGradient(colCount, cols);
         xMin = colRange[0];
         xMax = colRange[1];
 
-        int[] rowRange = findLongestRun(rowCount, rows);
+        int[] rowRange = findEdgeByGradient(rowCount, rows);
         yMin = rowRange[0];
         yMax = rowRange[1];
+
+        Log.d(TAG, String.format("梯度法检测结果: xRange=[%d, %d] (%d像素), yRange=[%d, %d] (%d像素)",
+                xMin, xMax, (xMax - xMin + 1), yMin, yMax, (yMax - yMin + 1)));
     }
 
     /**
@@ -226,9 +486,9 @@ public class ObjectDimensionCalculator {
         float minZ = Float.MAX_VALUE, maxZ = Float.MIN_VALUE;
 
         for (int x = xMin; x <= xMax; x++) {
-            if (colCount[x] < MIN_PROJECTION_COUNT) continue;
+            if (colCount[x] < dynamicThresholdX) continue;
             for (int y = yMin; y <= yMax; y++) {
-                if (rowCount[y] < MIN_PROJECTION_COUNT) continue;
+                if (rowCount[y] < dynamicThresholdY) continue;
                 if (mask[x][y] != 1) continue;
 
                 validPixelCount++;
@@ -325,14 +585,14 @@ public class ObjectDimensionCalculator {
     }
 
     /**
-     * 在投影数组中找最长连续有效段
+     * 在投影数组中找最长连续有效段（保留原方法作为备用）
      */
-    private int[] findLongestRun(int[] counts, int length) {
+    private int[] findLongestRun(int[] counts, int length, int threshold) {
         int bestStart = -1, bestEnd = -1, bestLen = 0;
         int curStart = -1, curLen = 0;
 
         for (int i = 0; i < length; i++) {
-            if (counts[i] >= MIN_PROJECTION_COUNT) {
+            if (counts[i] >= threshold) {
                 if (curStart == -1) curStart = i;
                 curLen++;
                 if (curLen > bestLen) {
@@ -346,6 +606,64 @@ public class ObjectDimensionCalculator {
             }
         }
         return new int[]{bestStart, bestEnd};
+    }
+
+    /**
+     * 混合法：梯度检测 + 收缩1像素
+     *
+     * 原理：
+     * 1. 找count值变化最剧烈的位置（最大梯度）作为边界
+     * 2. 向内收缩1像素，消除边缘模糊
+     */
+    private int[] findEdgeByGradient(int[] counts, int length) {
+        if (length < 3) return new int[]{-1, -1};
+
+        // Step 1: 找count最大值的位置（物体中心）
+        int maxCount = 0, maxIndex = 0;
+        for (int i = 0; i < length; i++) {
+            if (counts[i] > maxCount) {
+                maxCount = counts[i];
+                maxIndex = i;
+            }
+        }
+
+        if (maxCount < MIN_PROJECTION_COUNT_ABSOLUTE) {
+            return new int[]{-1, -1}; // 没有有效物体
+        }
+
+        // Step 2: 从中心向左找最大正梯度
+        int leftEdge = 0;
+        int maxLeftGradient = 0;
+        for (int i = 1; i <= maxIndex; i++) {
+            int gradient = counts[i] - counts[i - 1];
+            if (gradient > maxLeftGradient) {
+                maxLeftGradient = gradient;
+                leftEdge = i;
+            }
+        }
+
+        // Step 3: 从中心向右找最大负梯度
+        int rightEdge = length - 1;
+        int maxRightGradient = 0; // 负值，所以用0初始化
+        for (int i = maxIndex; i < length - 1; i++) {
+            int gradient = counts[i + 1] - counts[i]; // 负值
+            if (gradient < maxRightGradient) {
+                maxRightGradient = gradient;
+                rightEdge = i;
+            }
+        }
+
+        // Step 4: 收缩1像素
+        int finalLeft = leftEdge + 1;
+        int finalRight = rightEdge - 1;
+
+        // 确保范围有效
+        if (finalLeft > finalRight) {
+            finalLeft = leftEdge;
+            finalRight = rightEdge;
+        }
+
+        return new int[]{finalLeft, finalRight};
     }
 
     // ==================== 统计信息 ====================
@@ -391,9 +709,8 @@ public class ObjectDimensionCalculator {
     // ==================== Getters ====================
 
     public int[][] getMask() { return mask; }
-    public int[] getColCount() { return colCount; }
-    public int[] getRowCount() { return rowCount; }
-    public int getMinProjectionCount() { return MIN_PROJECTION_COUNT; }
+    // getColCount 和 getRowCount 在前面已定义（支持克隆数组用于多帧滤波）
+    public int getMinProjectionCount() { return dynamicThresholdX; }
     public float getWidth() { return width; }
     public float getLength() { return length; }
     public float getHeight() { return height; }
@@ -422,9 +739,9 @@ public class ObjectDimensionCalculator {
         float sumDepth = 0;
         int count = 0;
         for (int x = xMin; x <= xMax; x++) {
-            if (colCount[x] < MIN_PROJECTION_COUNT) continue;
+            if (colCount[x] < dynamicThresholdX) continue;
             for (int y = yMin; y <= yMax; y++) {
-                if (rowCount[y] < MIN_PROJECTION_COUNT) continue;
+                if (rowCount[y] < dynamicThresholdY) continue;
                 if (mask[x][y] != 1) continue;
                 float depth = currentDepth[x][y];
                 if (depth > 0) {
@@ -445,7 +762,7 @@ public class ObjectDimensionCalculator {
     public boolean isValidPixel(int x, int y) {
         if (mask[x][y] != 1) return false;
         if (colCount == null || rowCount == null) return false;
-        return colCount[x] >= MIN_PROJECTION_COUNT && rowCount[y] >= MIN_PROJECTION_COUNT;
+        return colCount[x] >= dynamicThresholdX && rowCount[y] >= dynamicThresholdY;
     }
 
     public float getDepthDiffAt(int x, int y) {

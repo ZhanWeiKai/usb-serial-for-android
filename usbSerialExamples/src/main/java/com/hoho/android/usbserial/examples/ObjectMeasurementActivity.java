@@ -28,6 +28,10 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
+import com.hoho.android.usbserial.examples.FrameBuffer;
+
+// 多帧中值滤波 (用于梯度检测降噪)
+
 /**
  * 物体尺寸测量 Activity
  *
@@ -66,7 +70,7 @@ public class ObjectMeasurementActivity extends Activity {
     private float pixelSizeX;  // 水平方向每像素对应的 mm
     private float pixelSizeY;  // 垂直方向每像素对应的 mm
 
-    private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (考虑噪声余量)
+    private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (mm)
 
     // 串口
     private UsbSerialPort usbSerialPort;
@@ -103,6 +107,10 @@ public class ObjectMeasurementActivity extends Activity {
     private List<Float> stableWidths = new ArrayList<>();
     private List<Float> stableLengths = new ArrayList<>();
     private List<Float> stableHeights = new ArrayList<>();
+
+    // 多帧中值缓冲器 (用于梯度检测降噪)
+    private FrameBuffer frameBuffer = new FrameBuffer(100);
+    private long frameStartTime = 0; // 当前采集窗口开始时间
 
     // UI
     private TextView statusText;
@@ -592,16 +600,28 @@ public class ObjectMeasurementActivity extends Activity {
             statusText.setText("状态: 基线校准完成 ✓ (监控中)");
             StringBuilder sb = new StringBuilder();
             sb.append("══════ 基线校准完成 ══════\n\n");
-            sb.append(String.format("中心点深度: %.0f mm\n", centerDepth));
+            sb.append(String.format("中心点深度: %.0f mm (%.1f cm)\n", centerDepth, centerDepth / 10.0));
             sb.append(String.format("像素尺寸: X=%.2f mm, Y=%.2f mm\n", pixelSizeX, pixelSizeY));
             sb.append(String.format("基线帧数: %d 帧平均\n\n", frameCount));
+
+            // 显示空桌面的像素范围和物理尺寸
+            int imageWidth = 100;  // 图像宽度像素
+            int imageHeight = 100; // 图像高度像素
+            float physicalWidthMm = imageWidth * pixelSizeX;  // X方向物理尺寸
+            float physicalHeightMm = imageHeight * pixelSizeY; // Y方向物理尺寸
+            sb.append("══════ 空桌面视野范围 ══════\n");
+            sb.append(String.format("像素范围: %d × %d\n", imageWidth, imageHeight));
+            sb.append(String.format("物理尺寸: %.1f × %.1f cm\n", physicalWidthMm / 10.0, physicalHeightMm / 10.0));
+            sb.append(String.format("(宽 × 长)\n\n", pixelSizeX, pixelSizeY));
+
             sb.append("基线已保存到本地\n\n");
             sb.append("基线深度统计:\n");
             sb.append(getDepthStatistics(baselineDepth));
             sb.append("\n\n正在监控位置变化...");
             infoText.setText(sb.toString());
-            appendLog(String.format("基线校准完成 (%d帧平均)，中心点深度: %.0f mm，像素尺寸: X=%.2f Y=%.2f mm",
-                    frameCount, centerDepth, pixelSizeX, pixelSizeY));
+            appendLog(String.format("基线校准完成 (%d帧平均)，中心点深度: %.0f mm，像素尺寸: X=%.2f Y=%.2f mm，视野范围: %.1f×%.1f cm",
+                    frameCount, centerDepth, pixelSizeX, pixelSizeY,
+                    100 * pixelSizeX / 10.0, 100 * pixelSizeY / 10.0));
         });
 
         // 不停止采样，切换到位置监控模式
@@ -660,6 +680,11 @@ public class ObjectMeasurementActivity extends Activity {
         int[] colCount = calculator.getColCount();
         int[] rowCount = calculator.getRowCount();
         int minProjCount = calculator.getMinProjectionCount();
+
+        // 防御性检查：如果投影数据为空，跳过热力图更新
+        if (colCount == null || rowCount == null) {
+            return;
+        }
 
         // 获取有效像素的边界范围，用于画叉叉标记
         int bxMin = calculator.getXMin();
@@ -973,6 +998,8 @@ public class ObjectMeasurementActivity extends Activity {
         lastWidth = 0; lastLength = 0; lastHeight = 0;
         lastResult = null;
         noiseMask = null;
+        frameBuffer.clear();  // 清空帧缓冲器
+        frameStartTime = 0;   // 重置采集窗口时间
         stableWidths.clear();
         stableLengths.clear();
         stableHeights.clear();
@@ -998,12 +1025,61 @@ public class ObjectMeasurementActivity extends Activity {
         // 将原始数据转换为距离矩阵
         currentDepth = convertToDistanceMatrix(latestDepthData);
 
+        // 创建计算器，处理当前帧
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
                 (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, OBJECT_THRESHOLD_MM, noiseMask
         );
 
-        ObjectDimensionCalculator.DimensionResult result = calculator.calculate();
+        // 先生成mask和投影数据（不计算最终尺寸）
+        calculator.generateMask();
+
+        // 如果没有检测到物体，不添加到帧缓冲器（避免累积全 0 的无效数据）
+        if (calculator.getObjectPixelCount() == 0) {
+            runOnUiThread(() -> {
+                infoText.setText("未检测到物体\n\n请将物体放置在桌面上");
+            });
+            return;
+        }
+
+        calculator.calculateProjectionOnly();  // 计算投影数据供多帧中值使用
+        int[] colCount = calculator.getColCount();
+        int[] rowCount = calculator.getRowCount();
+
+        if (colCount == null || rowCount == null) {
+            return;
+        }
+
+        // 添加到帧缓冲器
+        frameBuffer.addFrame(colCount, rowCount);
+        int frameCount = frameBuffer.getFrameCount();
+
+        // 检查是否有足够的帧
+        if (frameCount < FrameBuffer.MIN_FRAMES) {
+            // 岨数不够，继续累积
+            runOnUiThread(() -> {
+                infoText.setText(String.format("正在采集帧数据... %d/%d",
+                        frameCount, FrameBuffer.MIN_FRAMES));
+            });
+            return;
+        }
+
+        // 有足够的帧，使用中值数据做梯度检测
+        int[] medianColCount = frameBuffer.getMedianColCount();
+        int[] medianRowCount = frameBuffer.getMedianRowCount();
+
+        // 防御性检查：确保中值数据有效
+        if (medianColCount == null || medianRowCount == null) {
+            runOnUiThread(() -> {
+                infoText.setText("等待帧数据累积...");
+            });
+            return;
+        }
+
+        // 使用中值数据计算尺寸
+        ObjectDimensionCalculator.DimensionResult result = calculator
+                .calculateDimensionsByCalibratedRatioWithMedianData(
+                        pixelSizeX, pixelSizeY, medianColCount, medianRowCount);
 
         String maskStats = calculator.getMaskDepthDiffStats();
 
@@ -1308,6 +1384,7 @@ public class ObjectMeasurementActivity extends Activity {
         stableWidths.clear();
         stableLengths.clear();
         stableHeights.clear();
+        frameBuffer.clear();  // 清空帧缓冲器
 
         // 删除保存的基线文件
         boolean deleted = depthStorage.deleteBaseline();
