@@ -143,19 +143,21 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void createLayout() {
-        // 根布局：水平，左边内容，右边热力图
+        // 根布局：可滚动的垂直布局，内容在上方，热力图在下方（原 logView 位置）
+        ScrollView rootScroll = new ScrollView(this);
+        rootScroll.setFillViewport(true);
+
         LinearLayout rootLayout = new LinearLayout(this);
-        rootLayout.setOrientation(LinearLayout.HORIZONTAL);
+        rootLayout.setOrientation(LinearLayout.VERTICAL);
         rootLayout.setBackgroundColor(Color.parseColor("#1E1E1E"));
         rootLayout.setPadding(16, 16, 16, 16);
 
-        // ===== 左侧面板：原来的内容 =====
+        // ===== 主内容面板：状态 + 文本 + 热力图 + 按钮 =====
         LinearLayout leftPanel = new LinearLayout(this);
         leftPanel.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams leftParams = new LinearLayout.LayoutParams(
-                0,
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                1.0f
+                LinearLayout.LayoutParams.WRAP_CONTENT
         );
         leftPanel.setLayoutParams(leftParams);
 
@@ -184,8 +186,7 @@ public class ObjectMeasurementActivity extends Activity {
         infoText.setPadding(16, 16, 16, 16);
         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1.0f
+                LinearLayout.LayoutParams.WRAP_CONTENT
         );
         infoText.setLayoutParams(infoParams);
         infoText.setText("等待连接...");
@@ -247,19 +248,8 @@ public class ObjectMeasurementActivity extends Activity {
         leftPanel.addView(statusText);
         leftPanel.addView(frameStatsText);
         leftPanel.addView(infoText);
-        leftPanel.addView(scrollView);
-        leftPanel.addView(buttonLayout);
 
-        // ===== 右侧面板：热力图 =====
-        LinearLayout rightPanel = new LinearLayout(this);
-        rightPanel.setOrientation(LinearLayout.VERTICAL);
-        rightPanel.setPadding(16, 0, 0, 0);
-        LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.MATCH_PARENT
-        );
-        rightPanel.setLayoutParams(rightParams);
-
+        // 热力图放在原 logView 位置（infoText 下方，按钮上方）
         // 热力图标题
         TextView heatmapTitle = new TextView(this);
         heatmapTitle.setTextColor(Color.parseColor("#888888"));
@@ -268,9 +258,9 @@ public class ObjectMeasurementActivity extends Activity {
         heatmapTitle.setText("差异热力图");
         heatmapTitle.setPadding(0, 0, 0, 8);
 
-        // 热力图 ImageView
+        // 热力图 ImageView（进一步放大，便于观察细节）
         imgDiffHeatmap = new ImageView(this);
-        LinearLayout.LayoutParams heatmapParams = new LinearLayout.LayoutParams(300, 300);
+        LinearLayout.LayoutParams heatmapParams = new LinearLayout.LayoutParams(700, 700);
         imgDiffHeatmap.setLayoutParams(heatmapParams);
         imgDiffHeatmap.setScaleType(ImageView.ScaleType.FIT_CENTER);
         imgDiffHeatmap.setBackgroundColor(Color.parseColor("#101010"));
@@ -296,15 +286,19 @@ public class ObjectMeasurementActivity extends Activity {
         legendText.setText("蓝=低  →  红=高");
         legendText.setPadding(0, 8, 0, 0);
 
-        rightPanel.addView(heatmapTitle);
-        rightPanel.addView(imgDiffHeatmap);
-        rightPanel.addView(peakDepthText);
-        rightPanel.addView(legendText);
+        // 把热力图区域加到左侧面板（infoText 下面）
+        leftPanel.addView(heatmapTitle);
+        leftPanel.addView(imgDiffHeatmap);
+        leftPanel.addView(peakDepthText);
+        leftPanel.addView(legendText);
 
-        // 组装根布局
+        // 按钮放在最底部
+        leftPanel.addView(buttonLayout);
+
+        // 根布局只包含一个垂直面板，外面包一层 ScrollView 方便整体滚动
         rootLayout.addView(leftPanel);
-        rootLayout.addView(rightPanel);
-        setContentView(rootLayout);
+        rootScroll.addView(rootLayout);
+        setContentView(rootScroll);
     }
 
     private void connectUsb() {
@@ -667,9 +661,32 @@ public class ObjectMeasurementActivity extends Activity {
         int[] rowCount = calculator.getRowCount();
         int minProjCount = calculator.getMinProjectionCount();
 
-        // 最高点坐标（最大深度差点）
-        int peakX = calculator.getMaxDiffX();
-        int peakY = calculator.getMaxDiffY();
+        // 获取有效像素的边界范围，用于画叉叉标记
+        int bxMin = calculator.getXMin();
+        int bxMax = calculator.getXMax();
+        int byMin = calculator.getYMin();
+        int byMax = calculator.getYMax();
+
+        Log.d(TAG, "═══ updateDiffHeatmap 开始 ═══");
+        Log.d(TAG, String.format("有效像素范围: x[%d-%d] y[%d-%d]", bxMin, bxMax, byMin, byMax));
+
+        // 计算中心深度（边界中心点或有效像素平均深度）
+        float centerDepth = calculator.getCenterDepth();
+        float depthMin = centerDepth - 200;  // 深度下限
+        float depthMax = centerDepth + 200;  // 深度上限
+
+        Log.d(TAG, String.format("中心深度: %.1fmm, 有效范围: %.1f~%.1fmm", centerDepth, depthMin, depthMax));
+
+        // 收集异常深度信息和边缘像素深度
+        List<String> anomalyInfo = new ArrayList<>();
+        List<String> edgeDepthInfo = new ArrayList<>();
+        int anomalyCount = 0;
+
+        // 统计有效像素的深度分布
+        int validPixelStats = 0;
+        float minDepthFound = Float.MAX_VALUE;
+        float maxDepthFound = Float.MIN_VALUE;
+        float sumDepth = 0;
 
         // 注意：传感器内部使用的是 [x][y] = [列][行]，
         // 而 Bitmap 使用的是 (x=水平, y=垂直)。
@@ -677,7 +694,6 @@ public class ObjectMeasurementActivity extends Activity {
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 // 将 Bitmap 坐标 (x,y) 映射到传感器数据坐标 (dataX,dataY)。
-                // 如需旋转方向，只在这里调整映射关系，其他逻辑不受影响。
                 int dataX = x;
                 int dataY = y;
 
@@ -696,28 +712,184 @@ public class ObjectMeasurementActivity extends Activity {
             }
         }
 
-        // 在最高点位置画一个“X”形标记（使用亮紫色），方便肉眼识别
-        if (peakX >= 0 && peakY >= 0 &&
-                peakX < width && peakY < height) {
+        // 在有效像素范围的四个角画紫色叉叉标记
+        if (bxMin >= 0 && bxMax >= 0 && byMin >= 0 && byMax >= 0) {
             int crossColor = 0xFFFF00FF; // 亮紫色
             int arm = 2; // 叉叉臂长（像素）
-            for (int dy = -arm; dy <= arm; dy++) {
-                for (int dx = -arm; dx <= arm; dx++) {
-                    // 画对角线: abs(dx) == abs(dy)
-                    if (Math.abs(dx) != Math.abs(dy)) continue;
-                    int xx = peakX + dx;
-                    int yy = peakY + dy;
-                    if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
-                    int idx = yy * width + xx;
-                    diffPixels[idx] = crossColor;
+
+            // 四个角的位置
+            int[][] corners = {
+                {bxMin, byMin},  // 左上
+                {bxMax, byMin},  // 右上
+                {bxMin, byMax},  // 左下
+                {bxMax, byMax}   // 右下
+            };
+
+            for (int[] corner : corners) {
+                int cx = corner[0];
+                int cy = corner[1];
+                if (cx < 0 || cx >= width || cy < 0 || cy >= height) continue;
+
+                for (int dy = -arm; dy <= arm; dy++) {
+                    for (int dx = -arm; dx <= arm; dx++) {
+                        // 画对角线: abs(dx) == abs(dy)
+                        if (Math.abs(dx) != Math.abs(dy)) continue;
+                        int xx = cx + dx;
+                        int yy = cy + dy;
+                        if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+                        int idx = yy * width + xx;
+                        diffPixels[idx] = crossColor;
+                    }
                 }
             }
+
+            // 收集边缘像素深度信息
+            // 四条边：上、下、左、右
+            StringBuilder edgeSb = new StringBuilder();
+            edgeSb.append("边缘像素深度:\n");
+
+            // 上边缘 (y = byMin)
+            edgeSb.append(String.format("上边缘(y=%d): ", byMin));
+            for (int x = bxMin; x <= bxMax; x += 3) {
+                float depth = currentDepth[x][byMin];
+                boolean isAnomaly = depth < depthMin || depth > depthMax;
+                edgeSb.append(isAnomaly ? "*" : "");
+                edgeSb.append(String.format("%d=%.0f ", x, depth));
+            }
+            edgeSb.append("\n");
+
+            // 下边缘 (y = byMax)
+            edgeSb.append(String.format("下边缘(y=%d): ", byMax));
+            for (int x = bxMin; x <= bxMax; x += 3) {
+                float depth = currentDepth[x][byMax];
+                boolean isAnomaly = depth < depthMin || depth > depthMax;
+                edgeSb.append(isAnomaly ? "*" : "");
+                edgeSb.append(String.format("%d=%.0f ", x, depth));
+            }
+            edgeSb.append("\n");
+
+            // 左边缘 (x = bxMin)
+            edgeSb.append(String.format("左边缘(x=%d): ", bxMin));
+            for (int y = byMin; y <= byMax; y += 3) {
+                float depth = currentDepth[bxMin][y];
+                boolean isAnomaly = depth < depthMin || depth > depthMax;
+                edgeSb.append(isAnomaly ? "*" : "");
+                edgeSb.append(String.format("%d=%.0f ", y, depth));
+            }
+            edgeSb.append("\n");
+
+            // 右边缘 (x = bxMax)
+            edgeSb.append(String.format("右边缘(x=%d): ", bxMax));
+            for (int y = byMin; y <= byMax; y += 3) {
+                float depth = currentDepth[bxMax][y];
+                boolean isAnomaly = depth < depthMin || depth > depthMax;
+                edgeSb.append(isAnomaly ? "*" : "");
+                edgeSb.append(String.format("%d=%.0f ", y, depth));
+            }
+            edgeSb.append("\n");
+
+            edgeDepthInfo.add(edgeSb.toString());
+        }
+
+        // 用红色圈圈标记异常深度的像素
+        if (bxMin >= 0 && bxMax >= 0 && byMin >= 0 && byMax >= 0 && currentDepth != null) {
+            int circleColor = 0xFFFF0000; // 红色（更明显）
+
+            Log.d(TAG, String.format("开始检测异常深度, currentDepth!=null: %b", currentDepth != null));
+
+            for (int x = bxMin; x <= bxMax; x++) {
+                if (colCount[x] < minProjCount) continue;
+                for (int y = byMin; y <= byMax; y++) {
+                    if (rowCount[y] < minProjCount) continue;
+                    if (mask[x][y] != 1) continue;
+
+                    float depth = currentDepth[x][y];
+
+                    // 统计有效像素深度分布
+                    validPixelStats++;
+                    sumDepth += depth;
+                    if (depth < minDepthFound) minDepthFound = depth;
+                    if (depth > maxDepthFound) maxDepthFound = depth;
+
+                    if (depth < depthMin || depth > depthMax) {
+                        // 异常深度，画圈圈
+                        anomalyCount++;
+                        drawCircle(diffPixels, width, height, x, y, circleColor);
+
+                        // 记录异常信息（只记录前20个）
+                        if (anomalyCount <= 20) {
+                            anomalyInfo.add(String.format("(%d,%d)=%.0fmm", x, y, depth));
+                            Log.d(TAG, String.format("异常深度 #%d: (%d,%d)=%.1fmm (范围:%.1f~%.1f)",
+                                    anomalyCount, x, y, depth, depthMin, depthMax));
+                        }
+                    }
+                }
+            }
+
+            // 详细统计日志
+            if (validPixelStats > 0) {
+                float avgDepth = sumDepth / validPixelStats;
+                Log.d(TAG, String.format("有效像素深度统计: count=%d, min=%.1f, max=%.1f, avg=%.1f",
+                        validPixelStats, minDepthFound, maxDepthFound, avgDepth));
+            }
+            Log.d(TAG, String.format("异常检测结果: centerDepth=%.0f, range=%.0f~%.0f, anomaly=%d",
+                    centerDepth, depthMin, depthMax, anomalyCount));
+        } else {
+            Log.d(TAG, String.format("跳过异常检测: bxMin=%d, bxMax=%d, byMin=%d, byMax=%d, currentDepth=%s",
+                    bxMin, bxMax, byMin, byMax, currentDepth == null ? "null" : "ok"));
         }
 
         // 把像素数组刷进 Bitmap
         diffBitmap.setPixels(diffPixels, 0, width, 0, 0, width, height);
-        // 请求重绘
-        runOnUiThread(() -> imgDiffHeatmap.invalidate());
+
+        // 更新异常深度信息显示
+        final int finalAnomalyCount = anomalyCount;
+        final String anomalyText = anomalyInfo.isEmpty() ? "" :
+            String.format("异常深度(黄圈): %d个\n%s", finalAnomalyCount,
+                String.join(", ", anomalyInfo.subList(0, Math.min(10, anomalyInfo.size()))));
+        final String edgeText = edgeDepthInfo.isEmpty() ? "" : edgeDepthInfo.get(0);
+        final float finalCenterDepth = centerDepth;
+        final float finalDepthMin = depthMin;
+        final float finalDepthMax = depthMax;
+
+        runOnUiThread(() -> {
+            imgDiffHeatmap.invalidate();
+            // 更新异常信息显示
+            if (peakDepthText != null) {
+                StringBuilder sb = new StringBuilder();
+                sb.append(String.format("中心深度: %.0fmm\n", finalCenterDepth));
+                sb.append(String.format("有效范围: %.0f~%.0fmm\n", finalDepthMin, finalDepthMax));
+                sb.append("───────────────────\n");
+                sb.append(anomalyText);
+                if (!edgeText.isEmpty()) {
+                    sb.append("\n───────────────────\n");
+                    sb.append(edgeText);
+                    sb.append("(* 表示异常深度)\n");
+                }
+                peakDepthText.setText(sb.toString());
+            }
+        });
+    }
+
+    /**
+     * 在像素数组上画一个圈圈（更大的圈）
+     */
+    private void drawCircle(int[] pixels, int width, int height, int cx, int cy, int color) {
+        // 画一个更大的圈圈，半径为3像素
+        for (int dy = -3; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+                // 只画圈圈边缘，不是实心圆
+                int distSq = dx * dx + dy * dy;
+                if (distSq < 4 || distSq > 9) continue;  // 只画半径2-3的环
+
+                int px = cx + dx;
+                int py = cy + dy;
+                if (px >= 0 && px < width && py >= 0 && py < height) {
+                    int idx = py * width + px;
+                    pixels[idx] = color;
+                }
+            }
+        }
     }
 
     private float average(List<Float> values) {
@@ -828,35 +1000,24 @@ public class ObjectMeasurementActivity extends Activity {
 
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
-                pixelSizeX, pixelSizeY, OBJECT_THRESHOLD_MM, noiseMask
+                (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, OBJECT_THRESHOLD_MM, noiseMask
         );
 
         ObjectDimensionCalculator.DimensionResult result = calculator.calculate();
 
-        // 获取最高点的深度信息，方便在界面上展示
-        int peakX = calculator.getMaxDiffX();
-        int peakY = calculator.getMaxDiffY();
-        float peakBaseline = calculator.getMaxDiffBaselineDepth();
-        float peakCurrent = calculator.getMaxDiffCurrentDepth();
-        float peakDiff = peakBaseline - peakCurrent;
-
         String maskStats = calculator.getMaskDepthDiffStats();
-        if (peakX >= 0 && peakY >= 0) {
-            maskStats += String.format(
-                    "\n最高点: (x=%d,y=%d) baseline=%.0f mm, current=%.0f mm, diff=%.0f mm\n",
-                    peakX, peakY, peakBaseline, peakCurrent, peakDiff);
-        }
-        final String maskStatsFinal = maskStats;
 
-        // 更新右侧最高点 TextView
-        if (peakX >= 0 && peakY >= 0) {
-            final String peakText = String.format(
-                    "最高点: (x=%d,y=%d)\nbaseline=%.0f mm\ncurrent=%.0f mm\n差值=%.0f mm",
-                    peakX, peakY, peakBaseline, peakCurrent, peakDiff);
-            runOnUiThread(() -> peakDepthText.setText(peakText));
-        } else {
-            runOnUiThread(() -> peakDepthText.setText("最高点: -"));
-        }
+        // 添加调试信息：有效像素的像素坐标范围
+        int pxMin = calculator.getXMin();
+        int pxMax = calculator.getXMax();
+        int pyMin = calculator.getYMin();
+        int pyMax = calculator.getYMax();
+        maskStats += String.format(
+                "\n有效像素范围: x[%d-%d] y[%d-%d] (%d×%d=%d像素)\n",
+                pxMin, pxMax, pyMin, pyMax,
+                (pxMax - pxMin + 1), (pyMax - pyMin + 1),
+                (pxMax - pxMin + 1) * (pyMax - pyMin + 1));
+        final String maskStatsFinal = maskStats;
 
         // 更新差异热力图
         updateDiffHeatmap(calculator);
@@ -909,7 +1070,8 @@ public class ObjectMeasurementActivity extends Activity {
                     new ObjectDimensionCalculator.DimensionResult(
                         avgWidth, avgLength, avgHeight,
                         result.rawPixelCount, result.validPixelCount,
-                        "测量完成 (" + STABLE_COUNT_MEASURE + "帧平均)"
+                        "测量完成 (" + STABLE_COUNT_MEASURE + "帧平均)",
+                        result.xMin, result.xMax, result.yMin, result.yMax
                     );
                 finishMeasurement(avgResult, volumeCm3);
             }
@@ -971,6 +1133,7 @@ public class ObjectMeasurementActivity extends Activity {
             sb.append("─────────────────────────\n");
             sb.append(String.format("体积: %.1f cm³\n", volumeCm3));
             sb.append(String.format("有效像素: %d (原始Mask: %d)\n", result.validPixelCount, result.rawPixelCount));
+            sb.append(String.format("像素范围: x[%d-%d] y[%d-%d]\n", result.xMin, result.xMax, result.yMin, result.yMax));
             sb.append("═════════════════════════\n\n");
             sb.append("点击 [重置] 进行新测量");
             infoText.setText(sb.toString());
