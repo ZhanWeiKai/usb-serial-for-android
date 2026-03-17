@@ -51,12 +51,23 @@ public class ObjectMeasurementActivity extends Activity {
     private static final int HEAD_2 = 0xFF;
 
     // 采样参数
-    private static final long SAMPLE_INTERVAL_MS = 500;  // 0.5秒采样间隔
+    private static final long SAMPLE_INTERVAL_MS = 500;  // 0.5秒采样间隔 (输出刷新周期)
+    private static final int SAMPLES_PER_WINDOW = 10;    // 每个窗口内采样10帧
+    private static final long SAMPLE_FAST_INTERVAL_MS = 50;  // 窗口内快速采样间隔 (500/10=50 ≈ 2帧)
+
     private static final int STABLE_COUNT_CALIBRATE = 10; // 校准: 连续10次稳定 = 5秒
     private static final int STABLE_COUNT_MEASURE = 10;   // 测量: 连续10次稳定 = 5秒
 
+    // 窗口中值滤波参数
+    private Handler windowSamplingHandler = new Handler(Looper.getMainLooper());
+    private Runnable windowSamplingRunnable;
+    private int windowFrameCount = 0;
+    private Runnable pendingSampleAction;
+    private List<float[][]> windowFrames = new ArrayList<>();  // 窗口帧缓存
+    private float[][] latestMedianDepth;  // 中值降噪后的深度图
+
     // 稳定性阈值
-    private static final float BASELINE_AVG_THRESHOLD_MM = 20.0f;  // 基线平均值差异阈值 (mm)
+    private static final float BASELINE_AVG_THRESHOLD_MM = 14.0f;  // 基线平均值差异阈值 (mm) - 改为14mm
     private static final float POSITION_CHANGE_THRESHOLD_MM = 100.0f;  // 位置变化阈值 (mm)
     private static final float DIMENSION_THRESHOLD_MM = 20.0f;     // 长宽高各维度偏差阈值 (mm)
 
@@ -523,20 +534,21 @@ public class ObjectMeasurementActivity extends Activity {
             appendLog("开始基线校准");
         });
 
-        // 启动定时采样
-        startSampling(this::processCalibrationSample);
+        // 启动窗口采样模式 (每500ms采集10帧取中值)
+        startWindowSampling(this::processCalibrationSample);
     }
 
     private void processCalibrationSample() {
-        if (latestDepthData == null) {
+        // 使用中值降噪后的深度图， 而非原始数据
+        if (latestMedianDepth == null) {
             return;
         }
 
-        float[][] currentFrame = convertToDistanceMatrix(latestDepthData);
+        float[][] currentFrame = latestMedianDepth;  // 直接使用中值降噪后的深度图
 
         if (baselineDepth == null) {
-            baselineDepth = currentFrame;
-            calibrationFrames.add(currentFrame);
+            baselineDepth = copyDepthArray(currentFrame);
+            calibrationFrames.add(copyDepthArray(currentFrame));
             stableCount = 1;
             updateCalibrationUI(1, 0);
         } else {
@@ -544,16 +556,16 @@ public class ObjectMeasurementActivity extends Activity {
 
             if (avgDiff < BASELINE_AVG_THRESHOLD_MM) {
                 stableCount++;
-                calibrationFrames.add(currentFrame);
+                calibrationFrames.add(copyDepthArray(currentFrame));
                 updateCalibrationUI(stableCount, avgDiff);
 
                 if (stableCount >= STABLE_COUNT_CALIBRATE) {
                     finishCalibration();
                 }
             } else {
-                baselineDepth = currentFrame;
+                baselineDepth = copyDepthArray(currentFrame);
                 calibrationFrames.clear();
-                calibrationFrames.add(currentFrame);
+                calibrationFrames.add(copyDepthArray(currentFrame));
                 stableCount = 1;
                 updateCalibrationUI(1, avgDiff);
             }
@@ -574,8 +586,8 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     private void finishCalibration() {
-        // 多帧平均作为最终基线，消除单帧噪声
-        baselineDepth = averageFrames(calibrationFrames);
+        // 多帧中值作为最终基线，比平均值更抗噪声
+        baselineDepth = medianFrames(calibrationFrames);
         int frameCount = calibrationFrames.size();
         calibrationFrames = null;
 
@@ -1013,17 +1025,18 @@ public class ObjectMeasurementActivity extends Activity {
             appendLog("开始物体测量");
         });
 
-        // 启动定时采样
-        startSampling(this::processMeasurementSample);
+        // 启动窗口采样模式 (每500ms采集10帧取中值)
+        startWindowSampling(this::processMeasurementSample);
     }
 
     private void processMeasurementSample() {
-        if (latestDepthData == null || baselineDepth == null) {
+        // 使用中值降噪后的深度图（每500ms采集10帧取中值）
+        if (latestMedianDepth == null || baselineDepth == null) {
             return;
         }
 
-        // 将原始数据转换为距离矩阵
-        currentDepth = convertToDistanceMatrix(latestDepthData);
+        // 直接使用中值降噪后的深度图
+        currentDepth = copyDepthArray(latestMedianDepth);
 
         // 创建计算器，处理当前帧
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
@@ -1031,55 +1044,10 @@ public class ObjectMeasurementActivity extends Activity {
                 (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, OBJECT_THRESHOLD_MM, noiseMask
         );
 
-        // 先生成mask和投影数据（不计算最终尺寸）
-        calculator.generateMask();
-
-        // 如果没有检测到物体，不添加到帧缓冲器（避免累积全 0 的无效数据）
-        if (calculator.getObjectPixelCount() == 0) {
-            runOnUiThread(() -> {
-                infoText.setText("未检测到物体\n\n请将物体放置在桌面上");
-            });
-            return;
-        }
-
-        calculator.calculateProjectionOnly();  // 计算投影数据供多帧中值使用
-        int[] colCount = calculator.getColCount();
-        int[] rowCount = calculator.getRowCount();
-
-        if (colCount == null || rowCount == null) {
-            return;
-        }
-
-        // 添加到帧缓冲器
-        frameBuffer.addFrame(colCount, rowCount);
-        int frameCount = frameBuffer.getFrameCount();
-
-        // 检查是否有足够的帧
-        if (frameCount < FrameBuffer.MIN_FRAMES) {
-            // 岨数不够，继续累积
-            runOnUiThread(() -> {
-                infoText.setText(String.format("正在采集帧数据... %d/%d",
-                        frameCount, FrameBuffer.MIN_FRAMES));
-            });
-            return;
-        }
-
-        // 有足够的帧，使用中值数据做梯度检测
-        int[] medianColCount = frameBuffer.getMedianColCount();
-        int[] medianRowCount = frameBuffer.getMedianRowCount();
-
-        // 防御性检查：确保中值数据有效
-        if (medianColCount == null || medianRowCount == null) {
-            runOnUiThread(() -> {
-                infoText.setText("等待帧数据累积...");
-            });
-            return;
-        }
-
-        // 使用中值数据计算尺寸
+        // 直接计算尺寸（使用新的直接连续像素法）
+        // 深度图已经做了中值滤波，不需要再做投影数据的FrameBuffer
         ObjectDimensionCalculator.DimensionResult result = calculator
-                .calculateDimensionsByCalibratedRatioWithMedianData(
-                        pixelSizeX, pixelSizeY, medianColCount, medianRowCount);
+                .calculateDimensionsByCalibratedRatioWithMedianData(pixelSizeX, pixelSizeY);
 
         String maskStats = calculator.getMaskDepthDiffStats();
 
@@ -1089,21 +1057,19 @@ public class ObjectMeasurementActivity extends Activity {
         int pyMin = calculator.getYMin();
         int pyMax = calculator.getYMax();
         maskStats += String.format(
-                "\n有效像素范围: x[%d-%d] y[%d-%d] (%d×%d=%d像素)\n",
+                "\n边界像素范围: x[%d-%d] y[%d-%d] (%d×%d)\n",
                 pxMin, pxMax, pyMin, pyMax,
-                (pxMax - pxMin + 1), (pyMax - pyMin + 1),
-                (pxMax - pxMin + 1) * (pyMax - pyMin + 1));
+                (pxMax - pxMin + 1), (pyMax - pyMin + 1));
         final String maskStatsFinal = maskStats;
 
         // 更新差异热力图
         updateDiffHeatmap(calculator);
 
-        if (result == null || "未检测到物体".equals(result.message)) {
+        if (result == null || "未检测到物体".equals(result.message) || result.validPixelCount == 0) {
             runOnUiThread(() -> {
                 StringBuilder sb = new StringBuilder();
-                sb.append("未检测到物体\n\n请将物体放置在桌面上\n\n");
-                sb.append(String.format("有效像素: %d (原始Mask: %d)\n\n",
-                        result.validPixelCount, result.rawPixelCount));
+                sb.append("未检测到物体\n\n请将物体放置在桌面上\n");
+                sb.append("(物体需至少占8个连续像素)\n\n");
                 sb.append("───── Mask 诊断 ─────\n");
                 sb.append(maskStatsFinal);
                 infoText.setText(sb.toString());
@@ -1279,6 +1245,43 @@ public class ObjectMeasurementActivity extends Activity {
         return result;
     }
 
+    /**
+     * 将多帧深度数据取中值，比平均值更抗噪声
+     * 对脉冲噪声（如个别异常深度值)更鲁棒
+     */
+    private float[][] medianFrames(List<float[][]> frames) {
+        if (frames == null || frames.isEmpty()) return null;
+
+        int rows = frames.get(0).length;
+        int cols = frames.get(0)[0].length;
+        float[][] result = new float[rows][cols];
+        int frameCount = frames.size();
+
+        // 临时数组用于排序
+        float[] values = new float[frameCount];
+
+        for (int x = 0; x < rows; x++) {
+            for (int y = 0; y < cols; y++) {
+                // 收集所有帧在该像素位置的深度值
+                for (int f = 0; f < frameCount; f++) {
+                    values[f] = frames.get(f)[x][y];
+                }
+
+                // 排序
+                Arrays.sort(values);
+
+                // 取中值
+                if (frameCount % 2 == 1) {
+                    result[x][y] = values[frameCount / 2];
+                } else {
+                    // 偶数帧取中间两个的平均
+                    result[x][y] = (values[frameCount / 2 - 1] + values[frameCount / 2]) / 2.0f;
+                }
+            }
+        }
+        return result;
+    }
+
     private float[][] convertToDistanceMatrix(byte[] depthData) {
         float[][] matrix = new float[100][100];
         for (int x = 0; x < 100; x++) {
@@ -1347,28 +1350,90 @@ public class ObjectMeasurementActivity extends Activity {
                 min == Float.MAX_VALUE ? 0 : min, max, avg);
     }
 
-    private void startSampling(Runnable sampleAction) {
+    // ==================== 窗口采样机制 ====================
+
+    /**
+     * 启动窗口采样模式
+     * 在500ms内快速采集10帧，取中值后执行回调
+     */
+    private void startWindowSampling(Runnable sampleAction) {
         stopSampling();
-        Runnable newRunnable = new Runnable() {
+        windowFrames.clear();
+        windowFrameCount = 0;
+        pendingSampleAction = sampleAction;
+
+        windowSamplingRunnable = new Runnable() {
             @Override
             public void run() {
-                if (running && sampleRunnable == this) {
-                    sampleAction.run();
-                    if (sampleRunnable == this) {
-                        mainHandler.postDelayed(this, SAMPLE_INTERVAL_MS);
+                if (!running || windowSamplingRunnable != this) {
+                    return;  // 已停止，退出
+                }
+
+                // 如果还没有深度数据，等待后重试
+                if (latestDepthData == null) {
+                    runOnUiThread(() -> {
+                        frameStatsText.setText("等待深度数据...");
+                    });
+                    windowSamplingHandler.postDelayed(this, SAMPLE_FAST_INTERVAL_MS);
+                    return;
+                }
+
+                // 快速采集一帧
+                float[][] frame = convertToDistanceMatrix(latestDepthData);
+                windowFrames.add(frame);
+                windowFrameCount++;
+
+                // 更新UI显示
+                runOnUiThread(() -> {
+                    frameStatsText.setText(String.format("窗口采样: %d/%d帧", windowFrameCount, SAMPLES_PER_WINDOW));
+                });
+
+                // 采集满10帧后取中值
+                if (windowFrameCount >= SAMPLES_PER_WINDOW) {
+                    latestMedianDepth = medianFrames(windowFrames);
+                    windowFrames.clear();
+                    windowFrameCount = 0;
+
+                    // 执行回调
+                    if (pendingSampleAction != null) {
+                        pendingSampleAction.run();
                     }
+
+                    // 一个窗口完成，等待500ms后开始下一个窗口
+                    windowSamplingHandler.postDelayed(this, SAMPLE_INTERVAL_MS);
+                } else {
+                    // 窗口内：每50ms采集一帧
+                    windowSamplingHandler.postDelayed(this, SAMPLE_FAST_INTERVAL_MS);
                 }
             }
         };
-        sampleRunnable = newRunnable;
-        mainHandler.post(newRunnable);
+
+        // 启动窗口采样
+        windowSamplingHandler.post(windowSamplingRunnable);
     }
 
-    private void stopSampling() {
-        if (sampleRunnable != null) {
-            mainHandler.removeCallbacks(sampleRunnable);
-            sampleRunnable = null;
+    /**
+     * 停止窗口采样
+     */
+    private void stopWindowSampling() {
+        if (windowSamplingHandler != null) {
+            windowSamplingHandler.removeCallbacks(windowSamplingRunnable);
+            windowSamplingRunnable = null;
         }
+    }
+
+    /**
+     * 停止采样 (stopWindowSampling的别名)
+     */
+    private void stopSampling() {
+        stopWindowSampling();
+    }
+
+    /**
+     * 启动采样 (startWindowSampling的别名)
+     */
+    private void startSampling(Runnable sampleAction) {
+        startWindowSampling(sampleAction);
     }
 
     private void resetMeasurement() {
