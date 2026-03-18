@@ -24,6 +24,7 @@ import java.io.ByteArrayOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -65,6 +66,12 @@ public class ObjectMeasurementActivity extends Activity {
     private Runnable pendingSampleAction;
     private List<float[][]> windowFrames = new ArrayList<>();  // 窗口帧缓存
     private float[][] latestMedianDepth;  // 中值降噪后的深度图
+
+    // 测量时：取maxDepthDiff中位数对应的帧
+    private List<Float> windowMaxDepthDiffs = new ArrayList<>();  // 每帧的maxDepthDiff
+    private float stableMaxDepthDiff;      // 选中帧的maxDepthDiff
+    private int stableMaxDiffX, stableMaxDiffY;  // 选中帧maxDepthDiff的位置
+    private int stableXMin, stableXMax, stableYMin, stableYMax;  // 选中帧的边界范围
 
     // 稳定性阈值
     private static final float BASELINE_AVG_THRESHOLD_MM = 14.0f;  // 基线平均值差异阈值 (mm) - 改为14mm
@@ -1015,6 +1022,11 @@ public class ObjectMeasurementActivity extends Activity {
         stableWidths.clear();
         stableLengths.clear();
         stableHeights.clear();
+        windowMaxDepthDiffs.clear();  // 清空maxDepthDiff缓存
+        stableMaxDepthDiff = 0;
+        stableMaxDiffX = stableMaxDiffY = -1;
+        stableXMin = stableYMin = 100;
+        stableXMax = stableYMax = -1;
 
         runOnUiThread(() -> {
             btnCalibrate.setText("清除Mask");
@@ -1359,6 +1371,7 @@ public class ObjectMeasurementActivity extends Activity {
     private void startWindowSampling(Runnable sampleAction) {
         stopSampling();
         windowFrames.clear();
+        windowMaxDepthDiffs.clear();
         windowFrameCount = 0;
         pendingSampleAction = sampleAction;
 
@@ -1383,15 +1396,43 @@ public class ObjectMeasurementActivity extends Activity {
                 windowFrames.add(frame);
                 windowFrameCount++;
 
+                // 测量模式下：计算每帧的maxDepthDiff
+                if (currentPhase == MeasurementPhase.MEASURING && baselineDepth != null) {
+                    float maxDiff = 0;
+                    for (int x = 0; x < 100; x++) {
+                        for (int y = 0; y < 100; y++) {
+                            float bDepth = baselineDepth[x][y];
+                            float cDepth = frame[x][y];
+                            if (bDepth > 100 && bDepth < 800 && cDepth > 100 && cDepth < 800) {
+                                float diff = bDepth - cDepth;
+                                if (diff > maxDiff) {
+                                    maxDiff = diff;
+                                }
+                            }
+                        }
+                    }
+                    windowMaxDepthDiffs.add(maxDiff);
+                }
+
                 // 更新UI显示
+                final float frameMaxDiff = windowMaxDepthDiffs.isEmpty() ? 0 :
+                        windowMaxDepthDiffs.get(windowMaxDepthDiffs.size() - 1);
                 runOnUiThread(() -> {
-                    frameStatsText.setText(String.format("窗口采样: %d/%d帧", windowFrameCount, SAMPLES_PER_WINDOW));
+                    frameStatsText.setText(String.format("窗口采样: %d/%d帧 (maxDiff=%.1fmm)",
+                            windowFrameCount, SAMPLES_PER_WINDOW, frameMaxDiff));
                 });
 
                 // 采集满10帧后取中值
                 if (windowFrameCount >= SAMPLES_PER_WINDOW) {
-                    latestMedianDepth = medianFrames(windowFrames);
+                    // 测量模式：取maxDepthDiff中位数对应的帧
+                    if (currentPhase == MeasurementPhase.MEASURING && !windowMaxDepthDiffs.isEmpty()) {
+                        selectMedianMaxDiffFrame();
+                    } else {
+                        // 校准模式：对深度图每个像素取中值
+                        latestMedianDepth = medianFrames(windowFrames);
+                    }
                     windowFrames.clear();
+                    windowMaxDepthDiffs.clear();
                     windowFrameCount = 0;
 
                     // 执行回调
@@ -1410,6 +1451,111 @@ public class ObjectMeasurementActivity extends Activity {
 
         // 启动窗口采样
         windowSamplingHandler.post(windowSamplingRunnable);
+    }
+
+    /**
+     * 从10帧中选取maxDepthDiff中位数对应的那一帧
+     * 并记录该帧的maxDepthDiff、位置和边界范围
+     */
+    private void selectMedianMaxDiffFrame() {
+        if (windowMaxDepthDiffs.isEmpty() || windowFrames.isEmpty()) {
+            return;
+        }
+
+        // 复制并排序，找中位数
+        List<Float> sorted = new ArrayList<>(windowMaxDepthDiffs);
+        Collections.sort(sorted);
+        int midIndex = sorted.size() / 2;
+        float medianValue = sorted.get(midIndex);
+
+        // 找到最接近中位数的帧索引
+        int bestFrameIndex = 0;
+        float minDiff = Float.MAX_VALUE;
+        for (int i = 0; i < windowMaxDepthDiffs.size(); i++) {
+            float diff = Math.abs(windowMaxDepthDiffs.get(i) - medianValue);
+            if (diff < minDiff) {
+                minDiff = diff;
+                bestFrameIndex = i;
+            }
+        }
+
+        // 使用该帧作为输出
+        latestMedianDepth = windowFrames.get(bestFrameIndex);
+        stableMaxDepthDiff = windowMaxDepthDiffs.get(bestFrameIndex);
+
+        // 找该帧的maxDepthDiff位置和边界
+        float maxDiff = 0;
+        int maxX = -1, maxY = -1;
+        boolean[][] mask = new boolean[100][100];
+
+        for (int x = 0; x < 100; x++) {
+            for (int y = 0; y < 100; y++) {
+                float bDepth = baselineDepth[x][y];
+                float cDepth = latestMedianDepth[x][y];
+                if (bDepth > 100 && bDepth < 800 && cDepth > 100 && cDepth < 800) {
+                    float diff = bDepth - cDepth;
+                    if (diff > OBJECT_THRESHOLD_MM) {
+                        mask[x][y] = true;
+                    }
+                    if (diff > maxDiff) {
+                        maxDiff = diff;
+                        maxX = x;
+                        maxY = y;
+                    }
+                }
+            }
+        }
+
+        stableMaxDiffX = maxX;
+        stableMaxDiffY = maxY;
+
+        // 计算边界范围（连续像素法）
+        stableXMin = 100; stableXMax = -1;
+        stableYMin = 100; stableYMax = -1;
+
+        // 行方向：找连续>=8个有效像素的行
+        for (int y = 0; y < 100; y++) {
+            int consecutive = 0;
+            for (int x = 0; x < 100; x++) {
+                if (mask[x][y]) {
+                    consecutive++;
+                } else {
+                    if (consecutive >= 8) {
+                        if (y < stableYMin) stableYMin = y;
+                        if (y > stableYMax) stableYMax = y;
+                    }
+                    consecutive = 0;
+                }
+            }
+            if (consecutive >= 8) {
+                if (y < stableYMin) stableYMin = y;
+                if (y > stableYMax) stableYMax = y;
+            }
+        }
+
+        // 列方向：找连续>=8个有效像素的列
+        for (int x = 0; x < 100; x++) {
+            int consecutive = 0;
+            for (int y = 0; y < 100; y++) {
+                if (mask[x][y]) {
+                    consecutive++;
+                } else {
+                    if (consecutive >= 8) {
+                        if (x < stableXMin) stableXMin = x;
+                        if (x > stableXMax) stableXMax = x;
+                    }
+                    consecutive = 0;
+                }
+            }
+            if (consecutive >= 8) {
+                if (x < stableXMin) stableXMin = x;
+                if (x > stableXMax) stableXMax = x;
+            }
+        }
+
+        Log.d(TAG, String.format("10帧中位数帧: 第%d帧, maxDiff=%.1fmm, 位置(%d,%d), 边界x[%d-%d] y[%d-%d]",
+                bestFrameIndex + 1, stableMaxDepthDiff, stableMaxDiffX, stableMaxDiffY,
+                stableXMin, stableXMax, stableYMin, stableYMax));
     }
 
     /**
