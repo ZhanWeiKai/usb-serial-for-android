@@ -89,6 +89,15 @@ public class ObjectMeasurementActivity extends Activity {
     private float pixelSizeY;  // 垂直方向每像素对应的 mm
 
     private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (mm)
+    private static final float MAX_THRESHOLD_MM = 100.0f;     // 阈值上限 (mm)
+
+    // 动态阈值相关
+    private float currentMaskThreshold = OBJECT_THRESHOLD_MM;  // 当前mask阈值，初始50mm
+    private int unstableThresholdCount = 0;   // 不稳定计数（累计）
+    private int stableThresholdCount = 0;    // 稳定计数（累计）
+    private boolean thresholdLocked = false; // 阈值是否已锁定
+    private int lastXSpan = 0;               // 上一帧X方向像素跨度
+    private int lastYSpan = 0;               // 上一帧Y方向像素跨度
 
     // 串口
     private UsbSerialPort usbSerialPort;
@@ -1028,6 +1037,9 @@ public class ObjectMeasurementActivity extends Activity {
         stableXMin = stableYMin = 100;
         stableXMax = stableYMax = -1;
 
+        // 重置动态阈值状态
+        resetDynamicThreshold();
+
         runOnUiThread(() -> {
             btnCalibrate.setText("清除Mask");
             btnCalibrate.setEnabled(true);
@@ -1050,10 +1062,10 @@ public class ObjectMeasurementActivity extends Activity {
         // 直接使用中值降噪后的深度图
         currentDepth = copyDepthArray(latestMedianDepth);
 
-        // 创建计算器，处理当前帧
+        // 使用动态阈值创建计算器
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
-                (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, OBJECT_THRESHOLD_MM, noiseMask
+                (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, currentMaskThreshold, noiseMask
         );
 
         // 直接计算尺寸（使用新的直接连续像素法）
@@ -1068,10 +1080,19 @@ public class ObjectMeasurementActivity extends Activity {
         int pxMax = calculator.getXMax();
         int pyMin = calculator.getYMin();
         int pyMax = calculator.getYMax();
+
+        // 计算像素跨度
+        int xSpan = (pxMax >= pxMin) ? (pxMax - pxMin + 1) : 0;
+        int ySpan = (pyMax >= pyMin) ? (pyMax - pyMin + 1) : 0;
+
+        // 更新动态阈值状态
+        String thresholdStatus = updateDynamicThreshold(xSpan, ySpan);
+
         maskStats += String.format(
                 "\n边界像素范围: x[%d-%d] y[%d-%d] (%d×%d)\n",
                 pxMin, pxMax, pyMin, pyMax,
-                (pxMax - pxMin + 1), (pyMax - pyMin + 1));
+                xSpan, ySpan);
+        maskStats += "\n───── 动态阈值 ─────\n" + thresholdStatus + "\n";
         final String maskStatsFinal = maskStats;
 
         // 更新差异热力图
@@ -1234,6 +1255,82 @@ public class ObjectMeasurementActivity extends Activity {
     }
 
     // ==================== 辅助方法 ====================
+
+    // ==================== 动态阈值调整 ====================
+
+    /**
+     * 更新动态阈值状态
+     *
+     * 逻辑：
+     * - 像素变化 >= 3：不稳定计数++，稳定计数重置
+     *   - 如果不稳定计数 >= 3 且阈值未锁定：阈值 += 5mm，同时重置不稳定和稳定计数
+     * - 像素变化 < 3：稳定计数++
+     *   - 如果稳定计数 >= 10：锁定阈值
+     *
+     * @param xSpan 当前X方向像素跨度
+     * @param ySpan 当前Y方向像素跨度
+     * @return 阈值状态描述字符串（用于UI显示）
+     */
+    private String updateDynamicThreshold(int xSpan, int ySpan) {
+        int xChange = Math.abs(xSpan - lastXSpan);
+        int yChange = Math.abs(ySpan - lastYSpan);
+        int pixelChange = Math.max(xChange, yChange);
+
+        String statusChange = "";
+
+        if (pixelChange >= 3) {
+            // 边界有跳动
+            unstableThresholdCount++;
+            stableThresholdCount = 0;  // 重置稳定计数
+
+            if (unstableThresholdCount >= 3 && !thresholdLocked) {
+                // 累计3次不稳定，收紧阈值
+                currentMaskThreshold += 5.0f;
+                if (currentMaskThreshold > MAX_THRESHOLD_MM) {
+                    currentMaskThreshold = MAX_THRESHOLD_MM;
+                }
+                // 阈值调整后，重置所有计数，重新观察
+                unstableThresholdCount = 0;
+                stableThresholdCount = 0;
+                statusChange = String.format("阈值收紧→%.0fmm", currentMaskThreshold);
+                Log.d(TAG, "动态阈值收紧至: " + currentMaskThreshold + "mm (像素变化=" + pixelChange + ")");
+            }
+        } else {
+            // 边界稳定 - 不重置不稳定计数（累计的）
+            if (!thresholdLocked) {
+                stableThresholdCount++;
+                if (stableThresholdCount >= 10) {
+                    thresholdLocked = true;
+                    statusChange = String.format("阈值锁定%.0fmm", currentMaskThreshold);
+                    Log.d(TAG, "动态阈值锁定在: " + currentMaskThreshold + "mm");
+                }
+            }
+        }
+
+        // 更新上一帧数据
+        lastXSpan = xSpan;
+        lastYSpan = ySpan;
+
+        // 返回状态描述
+        if (thresholdLocked) {
+            return String.format("阈值:%.0fmm(已锁定)", currentMaskThreshold);
+        } else {
+            return String.format("阈值:%.0fmm 不稳:%d 稳:%d/10", currentMaskThreshold, unstableThresholdCount, stableThresholdCount);
+        }
+    }
+
+    /**
+     * 重置动态阈值状态（开始新测量时调用）
+     */
+    private void resetDynamicThreshold() {
+        currentMaskThreshold = OBJECT_THRESHOLD_MM;
+        unstableThresholdCount = 0;
+        stableThresholdCount = 0;
+        thresholdLocked = false;
+        lastXSpan = 0;
+        lastYSpan = 0;
+        Log.d(TAG, "动态阈值已重置为: " + currentMaskThreshold + "mm");
+    }
 
     /**
      * 将多帧深度数据取平均，消除单帧噪声
