@@ -2,6 +2,7 @@ package com.hoho.android.usbserial.examples;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.Intent;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
@@ -118,6 +119,9 @@ public class DevicesFragment extends ListFragment {
                 dialog.dismiss();
             });
             builder.create().show();
+            return true;
+        } else if (id == R.id.sdk_demo) {
+            startActivity(new Intent(getActivity(), com.hoho.android.usbserial.measurement.ObjectMeasurerExampleActivity.class));
             return true;
         } else {
             return super.onOptionsItemSelected(item);

@@ -405,7 +405,8 @@ public class ObjectDimensionCalculator {
         ));
 
         return new DimensionResult(width, length, height, objectPixelCount, validPixelCount,
-                "计算成功(直接连续像素法)", xMin, xMax, yMin, yMax);
+                "计算成功(直接连续像素法)", xMin, xMax, yMin, yMax,
+                maxDepthDiffValue, objectSurfaceDepth);
     }
 
     /**
@@ -864,10 +865,21 @@ public class ObjectDimensionCalculator {
         public final String message;
         // 有效像素边界范围
         public final int xMin, xMax, yMin, yMax;
+        // 新增字段
+        public final float maxDepthDiff;         // 最大深度差 (mm)
+        public final float objectSurfaceDepth;   // 物体表面深度 (mm)
 
         public DimensionResult(float width, float length, float height,
                                int rawPixelCount, int validPixelCount, String message,
                                int xMin, int xMax, int yMin, int yMax) {
+            this(width, length, height, rawPixelCount, validPixelCount, message,
+                    xMin, xMax, yMin, yMax, 0, 0);
+        }
+
+        public DimensionResult(float width, float length, float height,
+                               int rawPixelCount, int validPixelCount, String message,
+                               int xMin, int xMax, int yMin, int yMax,
+                               float maxDepthDiff, float objectSurfaceDepth) {
             this.width = width;
             this.length = length;
             this.height = height;
@@ -878,6 +890,8 @@ public class ObjectDimensionCalculator {
             this.xMax = xMax;
             this.yMin = yMin;
             this.yMax = yMax;
+            this.maxDepthDiff = maxDepthDiff;
+            this.objectSurfaceDepth = objectSurfaceDepth;
         }
 
         @Override
