@@ -1,6 +1,8 @@
 package com.hoho.android.usbserial.examples;
 
 import android.app.Activity;
+import java.util.Map;
+import java.util.HashMap;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -59,6 +61,7 @@ public class ObjectMeasurementActivity extends Activity {
     private static final int STABLE_COUNT_CALIBRATE = 10; // 校准: 连续10次稳定 = 5秒
     private static final int STABLE_COUNT_MEASURE = 10;   // 测量: 连续10次稳定 = 5秒
     private static final int STABLE_COUNT_MEASURE_AFTER_LOCK = 5; // 阈值锁定后: 连续5次稳定
+    private static final int FIXED_MEASURE_COUNT = 30; // 固定测量帧数
 
     // 窗口中值滤波参数
     private Handler windowSamplingHandler = new Handler(Looper.getMainLooper());
@@ -89,16 +92,7 @@ public class ObjectMeasurementActivity extends Activity {
     private float pixelSizeX;  // 水平方向每像素对应的 mm
     private float pixelSizeY;  // 垂直方向每像素对应的 mm
 
-    private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (mm)
-    private static final float MAX_THRESHOLD_MM = 100.0f;     // 阈值上限 (mm)
-
-    // 动态阈值相关
-    private float currentMaskThreshold = OBJECT_THRESHOLD_MM;  // 当前mask阈值，初始50mm
-    private int unstableThresholdCount = 0;   // 不稳定计数（累计）
-    private int stableThresholdCount = 0;    // 稳定计数（累计）
-    private boolean thresholdLocked = false; // 阈值是否已锁定
-    private int lastXSpan = 0;               // 上一帧X方向像素跨度
-    private int lastYSpan = 0;               // 上一帧Y方向像素跨度
+    private static final float OBJECT_THRESHOLD_MM = 50.0f;  // 物体检测阈值 (mm，固定)
 
     // 串口
     private UsbSerialPort usbSerialPort;
@@ -135,6 +129,12 @@ public class ObjectMeasurementActivity extends Activity {
     private List<Float> stableWidths = new ArrayList<>();
     private List<Float> stableLengths = new ArrayList<>();
     private List<Float> stableHeights = new ArrayList<>();
+
+    // 固定测量帧累积 (用于取众数)
+    private int measureCount = 0;
+    private List<Float> measureWidths = new ArrayList<>();
+    private List<Float> measureLengths = new ArrayList<>();
+    private List<Float> measureHeights = new ArrayList<>();
 
     // 多帧中值缓冲器 (用于梯度检测降噪)
     private FrameBuffer frameBuffer = new FrameBuffer(100);
@@ -1032,6 +1032,10 @@ public class ObjectMeasurementActivity extends Activity {
         stableWidths.clear();
         stableLengths.clear();
         stableHeights.clear();
+        measureCount = 0;
+        measureWidths.clear();
+        measureLengths.clear();
+        measureHeights.clear();
         windowMaxDepthDiffs.clear();  // 清空maxDepthDiff缓存
         stableMaxDepthDiff = 0;
         stableMaxDiffX = stableMaxDiffY = -1;
@@ -1046,7 +1050,7 @@ public class ObjectMeasurementActivity extends Activity {
             btnCalibrate.setEnabled(true);
             btnMeasure.setEnabled(false);
             statusText.setText("状态: 物体测量中...");
-            infoText.setText(String.format("正在测量物体尺寸...\n\n请先点 [清除Mask] 消除噪声，再放置物体\n\n稳定进度: 0/%d(锁定后%d)", STABLE_COUNT_MEASURE, STABLE_COUNT_MEASURE_AFTER_LOCK));
+            infoText.setText(String.format("正在测量物体尺寸...\n\n请先点 [清除Mask] 消除噪声，再放置物体\n\n测量进度: 0/%d", FIXED_MEASURE_COUNT));
             appendLog("开始物体测量");
         });
 
@@ -1066,7 +1070,7 @@ public class ObjectMeasurementActivity extends Activity {
         // 使用动态阈值创建计算器
         ObjectDimensionCalculator calculator = new ObjectDimensionCalculator(
                 baselineDepth, currentDepth,
-                (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, currentMaskThreshold, noiseMask
+                (float)FOV_HORIZONTAL_DEG, (float)FOV_VERTICAL_DEG, OBJECT_THRESHOLD_MM, noiseMask
         );
 
         // 直接计算尺寸（使用新的直接连续像素法）
@@ -1086,14 +1090,11 @@ public class ObjectMeasurementActivity extends Activity {
         int xSpan = (pxMax >= pxMin) ? (pxMax - pxMin + 1) : 0;
         int ySpan = (pyMax >= pyMin) ? (pyMax - pyMin + 1) : 0;
 
-        // 更新动态阈值状态
-        String thresholdStatus = updateDynamicThreshold(xSpan, ySpan);
-
         maskStats += String.format(
                 "\n边界像素范围: x[%d-%d] y[%d-%d] (%d×%d)\n",
                 pxMin, pxMax, pyMin, pyMax,
                 xSpan, ySpan);
-        maskStats += "\n───── 动态阈值 ─────\n" + thresholdStatus + "\n";
+        maskStats += "\n───── 阈值: 固定50mm ─────\n";
         final String maskStatsFinal = maskStats;
 
         // 更新差异热力图
@@ -1115,61 +1116,38 @@ public class ObjectMeasurementActivity extends Activity {
         float diffW = Math.abs(result.width - lastWidth);
         float diffL = Math.abs(result.length - lastLength);
         float diffH = Math.abs(result.height - lastHeight);
-        float maxDimDiff = Math.max(diffW, Math.max(diffL, diffH));
 
-        if (maxDimDiff < DIMENSION_THRESHOLD_MM) {
-            stableCount++;
-            lastWidth = result.width;
-            lastLength = result.length;
-            lastHeight = result.height;
-            lastResult = result;
+        // 记录上一帧数据（用于显示差异）
+        lastWidth = result.width;
+        lastLength = result.length;
+        lastHeight = result.height;
+        lastResult = result;
 
-            // 累积稳定帧数据
-            stableWidths.add(result.width);
-            stableLengths.add(result.length);
-            stableHeights.add(result.height);
+        // 固定测量帧累积
+        measureCount++;
+        if (result.width > 0) measureWidths.add(result.width);
+        if (result.length > 0) measureLengths.add(result.length);
+        if (result.height > 0) measureHeights.add(result.height);
 
-            runOnUiThread(() -> {
-                updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStatsFinal);
-            });
+        runOnUiThread(() -> {
+            updateMeasurementUI(result, diffW, diffL, diffH, measureCount, maskStatsFinal);
+        });
 
-            if (stableCount >= (thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE)) {
-                int requiredCount = thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE;
-                // 计算稳定帧的平均值
-                float avgWidth = average(stableWidths);
-                float avgLength = average(stableLengths);
-                float avgHeight = average(stableHeights);
-                float volumeMm3 = avgWidth * avgLength * avgHeight;
-                float volumeCm3 = volumeMm3 / 1000.0f;
+        // 固定 30 帧后输出众数结果
+        if (measureCount >= FIXED_MEASURE_COUNT) {
+            int finalWidth = mode(measureWidths);
+            int finalLength = mode(measureLengths);
+            int finalHeight = mode(measureHeights);
+            float volumeCm3 = (float)(finalWidth * finalLength * finalHeight) / 1000.0f;
 
-                // 创建平均结果
-                ObjectDimensionCalculator.DimensionResult avgResult =
-                    new ObjectDimensionCalculator.DimensionResult(
-                        avgWidth, avgLength, avgHeight,
-                        result.rawPixelCount, result.validPixelCount,
-                        "测量完成 (" + requiredCount + "帧平均)",
-                        result.xMin, result.xMax, result.yMin, result.yMax
-                    );
-                finishMeasurement(avgResult, volumeCm3);
-            }
-        } else {
-            stableCount = 1;
-            lastWidth = result.width;
-            lastLength = result.length;
-            lastHeight = result.height;
-            lastResult = result;
-
-            // 重新开始累积
-            stableWidths.clear();
-            stableLengths.clear();
-            stableHeights.clear();
-            stableWidths.add(result.width);
-            stableLengths.add(result.length);
-            stableHeights.add(result.height);
-
-            runOnUiThread(() -> {
-                updateMeasurementUI(result, diffW, diffL, diffH, 1, maskStatsFinal);
-            });
+            ObjectDimensionCalculator.DimensionResult finalResult =
+                new ObjectDimensionCalculator.DimensionResult(
+                    finalWidth, finalLength, finalHeight,
+                    result.rawPixelCount, result.validPixelCount,
+                    "测量完成 (" + FIXED_MEASURE_COUNT + "帧众数)",
+                    result.xMin, result.xMax, result.yMin, result.yMax
+                );
+            finishMeasurement(finalResult, volumeCm3);
         }
     }
 
@@ -1178,8 +1156,7 @@ public class ObjectMeasurementActivity extends Activity {
                                      int count, String maskStats) {
         StringBuilder sb = new StringBuilder();
         sb.append("正在测量物体尺寸...\n\n");
-        int requiredCount = thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE;
-        sb.append(String.format("稳定进度: %d/%d (阈值: %.0fmm)\n", count, requiredCount, DIMENSION_THRESHOLD_MM));
+        sb.append(String.format("测量进度: %d/%d\n", count, FIXED_MEASURE_COUNT));
         sb.append(String.format("偏差: W:%.1f L:%.1f H:%.1fmm\n\n", diffW, diffL, diffH));
         sb.append("══════ 当前测量值 ══════\n");
         sb.append(String.format("宽(W): %.1f mm  (%.1f cm)\n", result.width, result.width / 10));
@@ -1259,87 +1236,34 @@ public class ObjectMeasurementActivity extends Activity {
 
     // ==================== 辅助方法 ====================
 
-    // ==================== 动态阈值调整 ====================
-
     /**
-     * 更新动态阈值状态
-     *
-     * 逻辑：
-     * - 像素变化 >= 3：不稳定计数++，稳定计数重置
-     *   - 如果不稳定计数 >= 3 且阈值未锁定：阈值 += 5mm，同时重置不稳定和稳定计数
-     * - 像素变化 < 3：稳定计数++
-     *   - 如果稳定计数 >= 10：锁定阈值
-     *
-     * @param xSpan 当前X方向像素跨度
-     * @param ySpan 当前Y方向像素跨度
-     * @return 阈值状态描述字符串（用于UI显示）
+     * 计算整数众数
+     * 截断小数转整数，过滤0值，取出现次数最多的整数（平局取最小）
      */
-    private String updateDynamicThreshold(int xSpan, int ySpan) {
-        int xChange = Math.abs(xSpan - lastXSpan);
-        int yChange = Math.abs(ySpan - lastYSpan);
-        int pixelChange = Math.max(xChange, yChange);
-
-        String statusChange = "";
-
-        if (pixelChange >= 3) {
-            // 边界有跳动
-            unstableThresholdCount++;
-            stableThresholdCount = 0;  // 重置稳定计数
-
-            if (unstableThresholdCount >= 3 && !thresholdLocked) {
-                // 累计3次不稳定，收紧阈值
-                currentMaskThreshold += 5.0f;
-                if (currentMaskThreshold > MAX_THRESHOLD_MM) {
-                    currentMaskThreshold = MAX_THRESHOLD_MM;
-                }
-                // 阈值到达上限，视为锁定
-                if (currentMaskThreshold >= MAX_THRESHOLD_MM) {
-                    thresholdLocked = true;
-                    statusChange = String.format("阈值已达上限%.0fmm(锁定)", currentMaskThreshold);
-                    Log.d(TAG, "动态阈值已达上限，锁定在: " + currentMaskThreshold + "mm");
-                } else {
-                    // 阈值调整后，重置所有计数，重新观察
-                    unstableThresholdCount = 0;
-                    stableThresholdCount = 0;
-                    statusChange = String.format("阈值收紧→%.0fmm", currentMaskThreshold);
-                }
-                Log.d(TAG, "动态阈值收紧至: " + currentMaskThreshold + "mm (像素变化=" + pixelChange + ")");
-            }
-        } else {
-            // 边界稳定 - 不重置不稳定计数（累计的）
-            if (!thresholdLocked) {
-                stableThresholdCount++;
-                if (stableThresholdCount >= 10) {
-                    thresholdLocked = true;
-                    statusChange = String.format("阈值锁定%.0fmm", currentMaskThreshold);
-                    Log.d(TAG, "动态阈值锁定在: " + currentMaskThreshold + "mm");
-                }
+    private int mode(List<Float> values) {
+        Map<Integer, Integer> freq = new HashMap<>();
+        for (float v : values) {
+            int iv = (int) v;
+            if (iv == 0) continue;
+            freq.put(iv, freq.getOrDefault(iv, 0) + 1);
+        }
+        int bestValue = 0;
+        int bestCount = 0;
+        for (Map.Entry<Integer, Integer> entry : freq.entrySet()) {
+            if (entry.getValue() > bestCount ||
+                (entry.getValue() == bestCount && entry.getKey() < bestValue)) {
+                bestCount = entry.getValue();
+                bestValue = entry.getKey();
             }
         }
-
-        // 更新上一帧数据
-        lastXSpan = xSpan;
-        lastYSpan = ySpan;
-
-        // 返回状态描述
-        if (thresholdLocked) {
-            return String.format("阈值:%.0fmm(已锁定)", currentMaskThreshold);
-        } else {
-            return String.format("阈值:%.0fmm 不稳:%d 稳:%d/10", currentMaskThreshold, unstableThresholdCount, stableThresholdCount);
-        }
+        return bestValue;
     }
 
     /**
      * 重置动态阈值状态（开始新测量时调用）
      */
     private void resetDynamicThreshold() {
-        currentMaskThreshold = OBJECT_THRESHOLD_MM;
-        unstableThresholdCount = 0;
-        stableThresholdCount = 0;
-        thresholdLocked = false;
-        lastXSpan = 0;
-        lastYSpan = 0;
-        Log.d(TAG, "动态阈值已重置为: " + currentMaskThreshold + "mm");
+        Log.d(TAG, "阈值重置: 固定50mm");
     }
 
     /**

@@ -19,7 +19,7 @@ public class ObjectDimensionCalculator {
     private static final int MIN_PROJECTION_COUNT_ABSOLUTE = 10; // 绝对最小阈值（防止噪声）
     private static final float PROJECTION_THRESHOLD_RATIO = 0.7f; // 动态阈值 = maxCount * ratio
     private static final int MIN_CONSECUTIVE_PIXELS = 8;  // 连续像素法: 连续>=8个有效像素才算边界
-    private static final float SMOOTHNESS_STDDEV_THRESHOLD = 15.0f; // Y方向标准差阈值 (mm)
+    private static final float SMOOTHNESS_STDDEV_THRESHOLD = 20.0f; // Y方向标准差阈值 (mm)
     private static final int SMOOTHNESS_MIN_PIXELS = 3;             // 最少像素数
     private int dynamicThresholdX = MIN_PROJECTION_COUNT_ABSOLUTE; // X方向动态阈值
     private int dynamicThresholdY = MIN_PROJECTION_COUNT_ABSOLUTE; // Y方向动态阈值
@@ -863,6 +863,7 @@ public class ObjectDimensionCalculator {
     public int getMaxDiffY() { return maxDiffY; }
     public float getMaxDiffBaselineDepth() { return maxDiffBaselineDepth; }
     public float getMaxDiffCurrentDepth() { return maxDiffCurrentDepth; }
+    public float getMaxDepthDiff() { return maxDepthDiffValue; }
 
     /**
      * 获取中心深度（有效像素的平均深度或边界中心点深度）
