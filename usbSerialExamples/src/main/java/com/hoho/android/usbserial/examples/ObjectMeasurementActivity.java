@@ -58,6 +58,7 @@ public class ObjectMeasurementActivity extends Activity {
 
     private static final int STABLE_COUNT_CALIBRATE = 10; // 校准: 连续10次稳定 = 5秒
     private static final int STABLE_COUNT_MEASURE = 10;   // 测量: 连续10次稳定 = 5秒
+    private static final int STABLE_COUNT_MEASURE_AFTER_LOCK = 5; // 阈值锁定后: 连续5次稳定
 
     // 窗口中值滤波参数
     private Handler windowSamplingHandler = new Handler(Looper.getMainLooper());
@@ -1045,7 +1046,7 @@ public class ObjectMeasurementActivity extends Activity {
             btnCalibrate.setEnabled(true);
             btnMeasure.setEnabled(false);
             statusText.setText("状态: 物体测量中...");
-            infoText.setText(String.format("正在测量物体尺寸...\n\n请先点 [清除Mask] 消除噪声，再放置物体\n\n稳定进度: 0/%d", STABLE_COUNT_MEASURE));
+            infoText.setText(String.format("正在测量物体尺寸...\n\n请先点 [清除Mask] 消除噪声，再放置物体\n\n稳定进度: 0/%d(锁定后%d)", STABLE_COUNT_MEASURE, STABLE_COUNT_MEASURE_AFTER_LOCK));
             appendLog("开始物体测量");
         });
 
@@ -1132,7 +1133,8 @@ public class ObjectMeasurementActivity extends Activity {
                 updateMeasurementUI(result, diffW, diffL, diffH, stableCount, maskStatsFinal);
             });
 
-            if (stableCount >= STABLE_COUNT_MEASURE) {
+            if (stableCount >= (thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE)) {
+                int requiredCount = thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE;
                 // 计算稳定帧的平均值
                 float avgWidth = average(stableWidths);
                 float avgLength = average(stableLengths);
@@ -1145,7 +1147,7 @@ public class ObjectMeasurementActivity extends Activity {
                     new ObjectDimensionCalculator.DimensionResult(
                         avgWidth, avgLength, avgHeight,
                         result.rawPixelCount, result.validPixelCount,
-                        "测量完成 (" + STABLE_COUNT_MEASURE + "帧平均)",
+                        "测量完成 (" + requiredCount + "帧平均)",
                         result.xMin, result.xMax, result.yMin, result.yMax
                     );
                 finishMeasurement(avgResult, volumeCm3);
@@ -1176,7 +1178,8 @@ public class ObjectMeasurementActivity extends Activity {
                                      int count, String maskStats) {
         StringBuilder sb = new StringBuilder();
         sb.append("正在测量物体尺寸...\n\n");
-        sb.append(String.format("稳定进度: %d/%d (阈值: %.0fmm)\n", count, STABLE_COUNT_MEASURE, DIMENSION_THRESHOLD_MM));
+        int requiredCount = thresholdLocked ? STABLE_COUNT_MEASURE_AFTER_LOCK : STABLE_COUNT_MEASURE;
+        sb.append(String.format("稳定进度: %d/%d (阈值: %.0fmm)\n", count, requiredCount, DIMENSION_THRESHOLD_MM));
         sb.append(String.format("偏差: W:%.1f L:%.1f H:%.1fmm\n\n", diffW, diffL, diffH));
         sb.append("══════ 当前测量值 ══════\n");
         sb.append(String.format("宽(W): %.1f mm  (%.1f cm)\n", result.width, result.width / 10));
@@ -1289,10 +1292,17 @@ public class ObjectMeasurementActivity extends Activity {
                 if (currentMaskThreshold > MAX_THRESHOLD_MM) {
                     currentMaskThreshold = MAX_THRESHOLD_MM;
                 }
-                // 阈值调整后，重置所有计数，重新观察
-                unstableThresholdCount = 0;
-                stableThresholdCount = 0;
-                statusChange = String.format("阈值收紧→%.0fmm", currentMaskThreshold);
+                // 阈值到达上限，视为锁定
+                if (currentMaskThreshold >= MAX_THRESHOLD_MM) {
+                    thresholdLocked = true;
+                    statusChange = String.format("阈值已达上限%.0fmm(锁定)", currentMaskThreshold);
+                    Log.d(TAG, "动态阈值已达上限，锁定在: " + currentMaskThreshold + "mm");
+                } else {
+                    // 阈值调整后，重置所有计数，重新观察
+                    unstableThresholdCount = 0;
+                    stableThresholdCount = 0;
+                    statusChange = String.format("阈值收紧→%.0fmm", currentMaskThreshold);
+                }
                 Log.d(TAG, "动态阈值收紧至: " + currentMaskThreshold + "mm (像素变化=" + pixelChange + ")");
             }
         } else {

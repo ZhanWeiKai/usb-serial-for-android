@@ -19,6 +19,8 @@ public class ObjectDimensionCalculator {
     private static final int MIN_PROJECTION_COUNT_ABSOLUTE = 10; // 绝对最小阈值（防止噪声）
     private static final float PROJECTION_THRESHOLD_RATIO = 0.7f; // 动态阈值 = maxCount * ratio
     private static final int MIN_CONSECUTIVE_PIXELS = 8;  // 连续像素法: 连续>=8个有效像素才算边界
+    private static final float SMOOTHNESS_STDDEV_THRESHOLD = 15.0f; // Y方向标准差阈值 (mm)
+    private static final int SMOOTHNESS_MIN_PIXELS = 3;             // 最少像素数
     private int dynamicThresholdX = MIN_PROJECTION_COUNT_ABSOLUTE; // X方向动态阈值
     private int dynamicThresholdY = MIN_PROJECTION_COUNT_ABSOLUTE; // Y方向动态阈值
 
@@ -103,6 +105,9 @@ public class ObjectDimensionCalculator {
         // Step 1: 生成物体 mask
         generateMask();
 
+        // Step 1.5: Y方向标准差平滑度滤波
+        smoothnessFilterByStdDev();
+
         if (objectPixelCount == 0) {
             return new DimensionResult(0, 0, 0, 0, 0, "未检测到物体", -1, -1, -1, -1);
         }
@@ -136,6 +141,9 @@ public class ObjectDimensionCalculator {
     public DimensionResult calculateDimensionsByCalibratedRatio(float pixelSizeX, float pixelSizeY) {
         // Step 1: 生成物体 mask
         generateMask();
+
+        // Step 1.5: Y方向标准差平滑度滤波
+        smoothnessFilterByStdDev();
 
         if (objectPixelCount == 0) {
             return new DimensionResult(0, 0, 0, 0, 0, "未检测到物体", -1, -1, -1, -1);
@@ -325,6 +333,9 @@ public class ObjectDimensionCalculator {
 
         // Step 1: 生成物体 mask
         generateMask();
+
+        // Step 1.5: Y方向标准差平滑度滤波
+        smoothnessFilterByStdDev();
 
         if (objectPixelCount == 0) {
             return new DimensionResult(0, 0, 0, 0, 0, "未检测到物体", -1, -1, -1, -1);
@@ -745,6 +756,53 @@ public class ObjectDimensionCalculator {
         }
 
         return new int[]{xMin, xMax, yMin, yMax};
+    }
+
+    // ==================== Y方向标准差平滑度滤波 ====================
+
+    /**
+     * Y方向标准差平滑度滤波
+     *
+     * 逐行计算 mask=1 像素 depthDiff 的标准差。
+     * 标准差 > 阈值的行判定为噪声，清除该行 mask。
+     * 注意：不做 X 方向，因为 45° 倾斜导致列内 depthDiff 自然渐变。
+     */
+    private void smoothnessFilterByStdDev() {
+        int cols = baselineDepth.length;
+        int rows = baselineDepth[0].length;
+
+        for (int y = 0; y < rows; y++) {
+            float[] diffs = new float[cols];
+            int count = 0;
+            for (int x = 0; x < cols; x++) {
+                if (mask[x][y] == 1) {
+                    diffs[count++] = baselineDepth[x][y] - currentDepth[x][y];
+                }
+            }
+            if (count < SMOOTHNESS_MIN_PIXELS) continue;
+
+            float mean = 0;
+            for (int i = 0; i < count; i++) mean += diffs[i];
+            mean /= count;
+
+            float variance = 0;
+            for (int i = 0; i < count; i++) {
+                float d = diffs[i] - mean;
+                variance += d * d;
+            }
+            float stdDev = (float) Math.sqrt(variance / count);
+
+            if (stdDev > SMOOTHNESS_STDDEV_THRESHOLD) {
+                for (int x = 0; x < cols; x++) {
+                    if (mask[x][y] == 1) {
+                        mask[x][y] = 0;
+                        objectPixelCount--;
+                    }
+                }
+                Log.d(TAG, String.format("平滑度滤波: 噪声行 y=%d, stdDev=%.1fmm, 清除%d像素",
+                        y, stdDev, count));
+            }
+        }
     }
 
     // ==================== 统计信息 ====================
