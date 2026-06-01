@@ -165,12 +165,12 @@ public class ObjectDimensionCalculator {
             return new DimensionResult(0, 0, 0, objectPixelCount, 0, "有效像素为空", xMin, xMax, yMin, yMax);
         }
 
-        // Step 4: 使用校准比例计算长宽
+        // Step 4: 使用校准比例计算长宽（横放：X=左右=长, Y=前后=宽）
         int xSpan = xMax - xMin + 1;
         int ySpan = yMax - yMin + 1;
 
-        width = xSpan * pixelSizeX;
-        length = ySpan * pixelSizeY;
+        length = xSpan * pixelSizeX;
+        width = ySpan * pixelSizeY;
 
         // Step 5: 高度仍用深度差异法
         calculateHeightByDepthDiff();
@@ -389,9 +389,9 @@ public class ObjectDimensionCalculator {
         float dynamicPixelSizeX = (float) (2.0 * objectSurfaceDepth * tanFovHHalf / 100.0);
         float dynamicPixelSizeY = (float) (2.0 * objectSurfaceDepth * tanFovVHalf / 100.0);
 
-        // Step 7: 最后计算长宽
-        width = xSpan * dynamicPixelSizeX;
-        length = ySpan * dynamicPixelSizeY;
+        // Step 7: 最后计算长宽（横放：X=左右=长, Y=前后=宽）
+        length = xSpan * dynamicPixelSizeX;
+        width = ySpan * dynamicPixelSizeY;
 
         Log.d(TAG, String.format(
                 "═══ 直接连续像素法计算结果 ═══\n" +
@@ -573,11 +573,11 @@ public class ObjectDimensionCalculator {
             return;
         }
 
-        // 宽度 = X 方向范围
-        width = maxX - minX;
+        // 长度 = X 方向范围（横放：X=左右=长）
+        length = maxX - minX;
 
-        // 长度 = Y 方向范围
-        length = maxY - minY;
+        // 宽度 = Y 方向范围（横放：Y=前后=宽）
+        width = maxY - minY;
 
         // 高度 = 最大深度差 × cos(45°)
         // 这是最可靠的方法，因为深度差直接测量了物体表面到桌面的距离
